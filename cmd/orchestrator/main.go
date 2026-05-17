@@ -23,6 +23,7 @@ import (
 
 	"github.com/pylyp-gh/ingest-orchestrator/internal/a2a"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/agentcard"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/elicit"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 )
@@ -51,21 +52,36 @@ func run() error {
 	claude := llm.New()
 	log.Printf("claude wrapper configured: model=%s", claude.Model())
 
-	mc, err := mcpclient.New(ctx, claude)
+	pending := elicit.NewPendingRegistry()
+
+	mc, err := mcpclient.New(ctx, claude, pending)
 	if err != nil {
 		return fmt.Errorf("init mcp client: %w", err)
 	}
 	defer mc.Close()
-	log.Printf("mcp client connected: %d tools available, sampling capability advertised", len(mc.Tools()))
+	log.Printf("mcp client connected: %d tools available, sampling+elicitation capabilities advertised", len(mc.Tools()))
 
 	handler := &a2a.Handler{Claude: claude, MCP: mc}
+	streamHandler := &a2a.StreamingHandler{Handler: handler, Pending: pending}
+	respondHandler := &a2a.RespondHandler{Pending: pending}
 
 	// A2A discovery — the Agent Card. Per RFC 8615 well-known URIs, this is
 	// the canonical entry point for peers to learn about the agent.
 	mux.HandleFunc("/.well-known/agent-card.json", agentcard.Handler())
 
-	// A2A SendMessage — drives the Claude tool-use loop calling MCP tools.
+	// A2A SendMessage (sync) — drives the Claude tool-use loop. Elicit
+	// requests during execution fall back to policy decisions (no SSE
+	// channel to push prompts on).
 	mux.HandleFunc("/messages", handler.SendMessage)
+
+	// A2A SendStreamingMessage — same agent loop, but emits SSE events as
+	// the work progresses and bridges MCP elicits to the peer via
+	// "input-required" events.
+	mux.HandleFunc("/messages:stream", streamHandler.SendStreamingMessage)
+
+	// Companion endpoint — peer POSTs here to satisfy an elicit it saw on
+	// the SSE stream. Body: {correlation_id, action, content}.
+	mux.HandleFunc("/messages:respond", respondHandler.Respond)
 
 	// Liveness probe — used by K8s readiness/liveness probes if deployed.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
