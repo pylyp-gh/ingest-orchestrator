@@ -23,6 +23,8 @@ import (
 
 	"github.com/pylyp-gh/ingest-orchestrator/internal/a2a"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/agentcard"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 )
 
 var (
@@ -40,12 +42,30 @@ func main() {
 func run() error {
 	mux := http.NewServeMux()
 
+	// Initialise dependencies — Claude wrapper (OpenAI SDK pointed at the
+	// gateway) and MCP client (Streamable HTTP to doc-writer-mcp). Both
+	// constructed once and reused across requests for connection keep-alive.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	claude := llm.New()
+	log.Printf("claude wrapper configured: model=%s", claude.Model())
+
+	mc, err := mcpclient.New(ctx)
+	if err != nil {
+		return fmt.Errorf("init mcp client: %w", err)
+	}
+	defer mc.Close()
+	log.Printf("mcp client connected: %d tools available", len(mc.Tools()))
+
+	handler := &a2a.Handler{Claude: claude, MCP: mc}
+
 	// A2A discovery — the Agent Card. Per RFC 8615 well-known URIs, this is
 	// the canonical entry point for peers to learn about the agent.
 	mux.HandleFunc("/.well-known/agent-card.json", agentcard.Handler())
 
-	// A2A SendMessage — primary task initiation endpoint.
-	mux.HandleFunc("/messages", a2a.SendMessageHandler())
+	// A2A SendMessage — drives the Claude tool-use loop calling MCP tools.
+	mux.HandleFunc("/messages", handler.SendMessage)
 
 	// Liveness probe — used by K8s readiness/liveness probes if deployed.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

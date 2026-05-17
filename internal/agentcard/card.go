@@ -66,11 +66,14 @@ func Default() Card {
 		Capabilities:    Capabilities{Streaming: true, PushNotifications: false},
 		Skills: []Skill{
 			{
-				ID:          "echo",
-				Name:        "Echo",
-				Description: "Returns the input text verbatim. Used for connectivity validation and A2A protocol smoke tests.",
-				Examples:    []string{"echo hello world"},
-				Tags:        []string{"diagnostic", "smoke-test"},
+				ID:          "ingest_document",
+				Name:        "Ingest Document",
+				Description: "Adds a new document to the Qdrant vector database via the doc-writer-mcp MCP server. Driven by Claude (via agentgateway), invokes the add_document tool with layered defence (L0 structural, L1 lexical + language gate + injection regex, L2 SHA-256 dedup, L5 LLM quality gate). Returns the assigned point ID, action (inserted/replaced/versioned/added_variant), and extracted metadata (title, tags, summary).",
+				Examples: []string{
+					"Запиши документацію: 'API endpoint POST /users створює нового користувача у системі та повертає його ID у форматі UUID v4.'",
+					"Ingest this README content: <paste>",
+				},
+				Tags: []string{"ingest", "documentation", "qdrant", "mcp", "claude"},
 			},
 		},
 	}

@@ -1,10 +1,8 @@
-// Package a2a implements the Agent-to-Agent (A2A) protocol HTTP endpoints
-// per a2a-protocol.org specification: SendMessage (POST /messages), GetTask,
-// ListTasks, streaming variants, etc.
+// Package a2a — handlers.go: HTTP handlers for the A2A protocol endpoints.
 //
-// Phase 1 covers the minimum needed to participate in A2A: SendMessage with
-// the "echo" skill. Later phases bridge to MCP server tools and surface
-// Sampling/Elicitation callbacks to the calling A2A peer.
+// SendMessage now drives the Claude tool-use loop (agent.go), feeding the
+// user's text through the LLM with the MCP tool list, looping on tool_calls
+// until a terminal text response. Replaces the Phase 1 echo behaviour.
 package a2a
 
 import (
@@ -14,11 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 )
 
-// SendMessageRequest mirrors the A2A spec request shape. Subset for Phase 1:
-// just the message field is required. Configuration/metadata can be added
-// later for streaming/push notifications.
+// SendMessageRequest mirrors the A2A spec request shape.
 type SendMessageRequest struct {
 	Message Message        `json:"message"`
 	Config  *Configuration `json:"configuration,omitempty"`
@@ -30,7 +28,7 @@ type Message struct {
 }
 
 type Content struct {
-	Type string `json:"type"` // "text" only in Phase 1
+	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 }
 
@@ -38,8 +36,6 @@ type Configuration struct {
 	ReturnImmediately bool `json:"returnImmediately,omitempty"`
 }
 
-// Task mirrors A2A Task object. Phase 1 keeps it simple — no contextId,
-// no artifacts; just status + history.
 type Task struct {
 	ID        string    `json:"id"`
 	ContextID string    `json:"contextId,omitempty"`
@@ -48,57 +44,63 @@ type Task struct {
 }
 
 type Status struct {
-	State     string    `json:"state"`     // SUBMITTED | WORKING | COMPLETED | FAILED | etc.
+	State     string    `json:"state"`
 	Timestamp time.Time `json:"timestamp"`
 	Message   string    `json:"message,omitempty"`
 }
 
-// SendMessageHandler handles POST /messages — the entry point for A2A
-// task initiation. For Phase 1, it routes the request through the only
-// implemented skill (echo) and returns the result synchronously.
-//
-// Future: dispatch via skill ID, support streaming via SSE, persist tasks
-// in memory/store for later GET /tasks/{id} retrieval.
-func SendMessageHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("decode: %v", err), http.StatusBadRequest)
-			return
-		}
-		userText := ""
-		for _, c := range req.Message.Content {
-			if c.Type == "text" {
-				userText += c.Text
-			}
-		}
-		// Echo skill — Phase 1 only.
-		response := echo(userText)
-		task := Task{
-			ID: uuid.NewString(),
-			Status: Status{
-				State:     "COMPLETED",
-				Timestamp: time.Now().UTC(),
-			},
-			History: []Message{
-				req.Message,
-				{Role: "agent", Content: []Content{{Type: "text", Text: response}}},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(task)
-	}
+// Handler bundles dependencies needed by the A2A handlers — Claude wrapper
+// and MCP client session. Constructed once at startup and reused across
+// requests (session reuse → connection keep-alive on both sides).
+type Handler struct {
+	Claude *llm.Claude
+	MCP    *mcpclient.Client
 }
 
-// echo — Phase 1 minimum skill. Just bounces text back, useful for
-// connectivity validation and protocol shape verification.
-func echo(text string) string {
-	if text == "" {
-		return "(empty input — A2A SendMessage received with no text content)"
+// SendMessage is the A2A POST /messages handler. Drives the Claude agent
+// loop and returns the resulting Task with full conversation history.
+func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	return fmt.Sprintf("echo: %s", text)
+	var req SendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode: %v", err), http.StatusBadRequest)
+		return
+	}
+	userText := ""
+	for _, c := range req.Message.Content {
+		if c.Type == "text" {
+			userText += c.Text
+		}
+	}
+
+	task := Task{
+		ID:     uuid.NewString(),
+		Status: Status{State: "WORKING", Timestamp: time.Now().UTC()},
+		History: []Message{req.Message},
+	}
+
+	answer, err := Loop(r.Context(), h.Claude, h.MCP, userText)
+	if err != nil {
+		task.Status = Status{
+			State:     "FAILED",
+			Timestamp: time.Now().UTC(),
+			Message:   err.Error(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(task)
+		return
+	}
+
+	task.Status = Status{State: "COMPLETED", Timestamp: time.Now().UTC()}
+	task.History = append(task.History, Message{
+		Role:    "agent",
+		Content: []Content{{Type: "text", Text: answer}},
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(task)
 }
