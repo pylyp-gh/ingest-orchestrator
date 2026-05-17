@@ -24,18 +24,11 @@
 package elicit
 
 import (
-	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 )
-
-// SSEStreamKey is the context key under which a *Stream is stored by the
-// streaming handler before it invokes work that may trigger Elicit. Reader
-// is the ElicitationHandler.
-type ctxKey int
-
-const SSEStreamKey ctxKey = 1
 
 // Result is the peer's reply to an elicit request — mirrors mcp.ElicitResult
 // at the protocol boundary, but kept in our own type to avoid leaking the SDK
@@ -46,14 +39,54 @@ type Result struct {
 }
 
 // PendingRegistry tracks in-flight elicitation requests waiting on peer
-// responses. Single instance per orchestrator process, shared by the
-// streaming handler and the respond handler.
+// responses, plus the currently-active SSE stream (if any) that the
+// ElicitationHandler should push prompts at.
+//
+// Why a registry holds the stream instead of plumbing through context:
+// MCP SDK invokes ElicitationHandler from an async JSON-RPC dispatcher
+// goroutine — its ctx is transport-level, NOT the ctx the caller passed
+// to CallTool. context.WithValue plumbing fundamentally cannot reach
+// across that boundary. The registry sidesteps that by stashing the
+// stream as process-wide state, with serialised access via the caller's
+// mutex.
+//
+// Trade-off: with a single shared stream slot, only ONE streaming
+// request can be in flight at a time. The streaming handler enforces
+// that via its own mutex. Concurrent streaming would need per-session
+// MCP clients — a much heavier change deferred until needed.
 type PendingRegistry struct {
-	m sync.Map // map[string]chan Result
+	m            sync.Map           // map[string]chan Result
+	activeStream atomic.Pointer[any] // *Stream — type erased to avoid import cycle
 }
 
 func NewPendingRegistry() *PendingRegistry {
 	return &PendingRegistry{}
+}
+
+// SetActiveStream registers s as the stream the ElicitationHandler should
+// push prompts at. Pass nil to clear (caller should always pair Set with
+// a deferred Set(nil) to release). Returns the previous stream so callers
+// can chain / restore if needed.
+//
+// `any` typed to avoid an import loop — the stream type is in the same
+// package, callers pass *Stream which type-asserts safely in ActiveStream.
+func (p *PendingRegistry) SetActiveStream(s *Stream) {
+	if s == nil {
+		p.activeStream.Store(nil)
+		return
+	}
+	var v any = s
+	p.activeStream.Store(&v)
+}
+
+// ActiveStream returns the registered stream, or (nil, false) if none.
+func (p *PendingRegistry) ActiveStream() (*Stream, bool) {
+	v := p.activeStream.Load()
+	if v == nil {
+		return nil, false
+	}
+	s, ok := (*v).(*Stream)
+	return s, ok && s != nil
 }
 
 // Register reserves a correlation ID and returns a channel that will
@@ -87,10 +120,3 @@ func (p *PendingRegistry) Deliver(correlationID string, r Result) bool {
 	}
 }
 
-// FromContext extracts the active SSE stream from ctx, if any. Returns
-// (nil, false) when no stream is attached — the ElicitationHandler then
-// falls back to its policy default.
-func FromContext(ctx context.Context) (*Stream, bool) {
-	s, ok := ctx.Value(SSEStreamKey).(*Stream)
-	return s, ok && s != nil
-}

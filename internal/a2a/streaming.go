@@ -16,11 +16,11 @@
 package a2a
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,9 +31,14 @@ import (
 // + MCP dependencies as the sync handler, plus the PendingRegistry shared
 // with /messages:respond so elicit replies route back to the waiting
 // handler goroutine.
+//
+// Mu serialises streaming requests so the registry's single active-stream
+// slot is never contested. Concurrent streams would need per-session MCP
+// clients — much heavier change, deferred until needed.
 type StreamingHandler struct {
 	*Handler
 	Pending *elicit.PendingRegistry
+	Mu      sync.Mutex
 }
 
 type streamEvent struct {
@@ -67,6 +72,12 @@ func (h *StreamingHandler) SendStreamingMessage(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	// Serialise streaming requests — registry's active-stream slot is a
+	// single-occupant resource. Brief blocking under concurrent load is
+	// fine for the lab use case (interactive, one user at a time).
+	h.Mu.Lock()
+	defer h.Mu.Unlock()
+
 	stream, err := elicit.NewStream(w)
 	if err != nil {
 		// Should not happen with stock net/http, but surface for debug.
@@ -74,6 +85,13 @@ func (h *StreamingHandler) SendStreamingMessage(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer stream.Close()
+
+	// Register stream in the process-wide registry so ElicitationHandler
+	// (which runs in MCP transport goroutine without our ctx) can push
+	// prompts to it. Defer the clear so policy fallback kicks in for any
+	// subsequent non-streaming request.
+	h.Pending.SetActiveStream(stream)
+	defer h.Pending.SetActiveStream(nil)
 
 	taskID := uuid.NewString()
 	emit := func(ev streamEvent) {
@@ -88,13 +106,7 @@ func (h *StreamingHandler) SendStreamingMessage(w http.ResponseWriter, r *http.R
 
 	emit(streamEvent{Status: "WORKING"})
 
-	// Attach SSE stream to context so ElicitationHandler can push events at
-	// the peer when invoked deep inside CallTool. The PendingRegistry is
-	// closed over by the handler at construction time, no ctx plumbing
-	// needed for it.
-	ctx := context.WithValue(r.Context(), elicit.SSEStreamKey, stream)
-
-	answer, err := Loop(ctx, h.Claude, h.MCP, userText)
+	answer, err := Loop(r.Context(), h.Claude, h.MCP, userText)
 	if err != nil {
 		emit(streamEvent{Status: "FAILED", Error: err.Error()})
 		return

@@ -189,9 +189,14 @@ func buildElicitationHandler(pending *elicit.PendingRegistry) func(context.Conte
 			return nil, fmt.Errorf("elicit: nil params")
 		}
 
-		stream, hasStream := elicit.FromContext(ctx)
+		// Look up the active stream via the registry, not via ctx.
+		// MCP SDK invokes elicit handlers from a background JSON-RPC
+		// dispatcher whose ctx is the transport's, NOT the ctx the caller
+		// passed to CallTool. ctx-plumbing fundamentally cannot reach
+		// across that boundary; the registry's atomic pointer does.
+		stream, hasStream := pending.ActiveStream()
 		if !hasStream {
-			log.Printf("[elicit] no SSE stream in context — applying policy fallback for message=%q", truncate(params.Message, 80))
+			log.Printf("[elicit] no active SSE stream — applying policy fallback for message=%q", truncate(params.Message, 80))
 			return policyDecision(params), nil
 		}
 
