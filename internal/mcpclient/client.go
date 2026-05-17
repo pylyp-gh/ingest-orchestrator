@@ -1,22 +1,32 @@
 // Package mcpclient wraps the modelcontextprotocol/go-sdk client for use by
-// the agent loop. Establishes a Streamable HTTP session to a target MCP
-// server (doc-writer-mcp у Phase 2), exposes ListTools and CallTool, and
-// keeps the session alive for the lifetime of the orchestrator process.
+// the agent loop. Establishes Streamable HTTP sessions to a target MCP
+// server (doc-writer-mcp), exposes ListTools and CallTool.
 //
-// Phase 3 adds a Sampling bridge — when the MCP server issues a
-// sampling/createMessage request (e.g. doc-writer-mcp's L5 verdict gate),
-// the registered CreateMessageHandler translates SamplingMessages into an
-// OpenAI ChatCompletion call against the same agentgateway-proxy used by
-// the agent loop.
+// Phase 3 (Sampling): when the MCP server issues a sampling/createMessage
+// request, the CreateMessageHandler translates SamplingMessages into an
+// OpenAI ChatCompletion call against agentgateway and returns the
+// completion.
 //
-// Phase 4 adds an Elicitation bridge. When the server issues
-// elicitation/create, the handler looks for an SSE stream on the request
-// context (placed there by the /messages:stream A2A handler) and pushes
-// an "input-required" event to the peer. Then blocks on a channel from
-// the PendingRegistry until the peer POSTs to /messages:respond with the
-// matching correlation ID. Without an attached stream (e.g. plain
-// /messages request) the handler falls back to a deterministic policy so
-// the tool flow doesn't deadlock.
+// Phase 4 (Elicitation): when the server issues elicitation/create, the
+// handler may either bridge to an SSE peer ("interactive" handler used
+// for /messages:stream requests) or apply a deterministic policy
+// fallback ("policy" handler used for sync /messages requests).
+//
+// Two constructors:
+//
+//   - New(): shared session used by the sync /messages handler. Policy
+//     ElicitationHandler — no peer to ask, so auto-decisions per schema.
+//
+//   - NewWithStream(): per-request session created for each streaming
+//     request. ElicitationHandler closure captures the request's SSE
+//     stream, fully isolating concurrent streams from each other.
+//
+// Why per-request session for streaming: MCP SDK invokes Elicitation /
+// Sampling handlers from an async dispatcher goroutine whose ctx is
+// transport-level — not the ctx the caller passed to CallTool. The only
+// way to get a per-request stream visible to the handler is to close it
+// in at session construction. Connection overhead (initialize + ListTools)
+// is paid per stream — acceptable for interactive use, optimisable later.
 package mcpclient
 
 import (
@@ -24,7 +34,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -33,10 +42,10 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 )
 
-// ElicitTimeout bounds how long the elicit bridge waits for a peer reply
-// before falling back to "decline". Generous so a human peer can reason
-// about the prompt, but short enough that orphaned MCP calls don't pile
-// up if peer disconnected.
+// ElicitTimeout bounds how long the interactive elicit bridge waits for
+// a peer reply before falling back to "cancel". Generous so a human peer
+// can reason about the prompt, but short enough that orphaned MCP calls
+// don't pile up if peer disconnected.
 const ElicitTimeout = 2 * time.Minute
 
 type Client struct {
@@ -51,28 +60,53 @@ func envOr(key, def string) string {
 	return def
 }
 
-// New connects to the configured MCP server URL via Streamable HTTP,
-// performs the initialize handshake, lists available tools, and returns
-// a ready-to-use client. Registers both Sampling and Elicitation handlers
-// so the SDK auto-advertises both capabilities during the handshake.
-func New(ctx context.Context, claude *llm.Claude, pending *elicit.PendingRegistry) (*Client, error) {
-	url := envOr("MCP_SERVER_URL", "https://doc-writer.ash.ph.lab/mcp")
-	impl := &mcp.Implementation{
+func mcpServerURL() string {
+	return envOr("MCP_SERVER_URL", "https://doc-writer.ash.ph.lab/mcp")
+}
+
+func implementation() *mcp.Implementation {
+	return &mcp.Implementation{
 		Name:    "ingest-orchestrator",
 		Version: "0.1.0",
 	}
+}
+
+// New connects a shared, long-lived MCP client used by the sync /messages
+// endpoint. ElicitationHandler uses the policy fallback (no peer stream
+// to push prompts at). Sampling handler bridges to Claude via gateway.
+func New(ctx context.Context, claude *llm.Claude) (*Client, error) {
 	opts := &mcp.ClientOptions{
 		CreateMessageHandler: buildSamplingHandler(claude),
-		ElicitationHandler:   buildElicitationHandler(pending),
+		ElicitationHandler:   buildPolicyElicitHandler(),
 	}
-	mcpClient := mcp.NewClient(impl, opts)
+	return connect(ctx, opts)
+}
+
+// NewWithStream connects a per-request MCP client whose ElicitationHandler
+// closure captures the given SSE stream. Each streaming request creates
+// one of these, uses it for the agent loop, then Close()s it. Concurrent
+// streams get independent sessions — no shared state, no head-of-line
+// blocking.
+//
+// pending is the process-wide PendingRegistry — correlation IDs are
+// globally unique, so multiple per-request sessions safely share it.
+func NewWithStream(ctx context.Context, claude *llm.Claude, pending *elicit.PendingRegistry, stream *elicit.Stream) (*Client, error) {
+	opts := &mcp.ClientOptions{
+		CreateMessageHandler: buildSamplingHandler(claude),
+		ElicitationHandler:   buildInteractiveElicitHandler(pending, stream),
+	}
+	return connect(ctx, opts)
+}
+
+// connect shares the boilerplate between New / NewWithStream.
+func connect(ctx context.Context, opts *mcp.ClientOptions) (*Client, error) {
+	url := mcpServerURL()
+	mcpClient := mcp.NewClient(implementation(), opts)
 	transport := &mcp.StreamableClientTransport{Endpoint: url}
 	session, err := mcpClient.Connect(ctx, transport, nil)
 	if err != nil {
 		return nil, fmt.Errorf("mcp connect %s: %w", url, err)
 	}
-	// List tools once at startup — keeps the agent loop fast and avoids
-	// repeating the round-trip on every call. Tools rarely change at runtime.
 	listResp, err := session.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
 		_ = session.Close()
@@ -113,12 +147,10 @@ func (c *Client) Close() error {
 //   - params.SystemPrompt → openai.SystemMessage (prepended)
 //   - params.Messages[].Role "user" → openai.UserMessage
 //   - params.Messages[].Role "assistant" → openai.AssistantMessage
-//   - params.Messages[].Content → only *TextContent supported in Phase 3
+//   - params.Messages[].Content → only *TextContent supported
 //
 // Tools deliberately omitted: doc-writer-mcp's L5 calls are single-turn
-// classification/extraction — no tool use needed. CreateMessageWithToolsHandler
-// (SDK variant) would be the place to wire tools if a future server requests
-// them; ignored here to keep the handler minimal.
+// classification/extraction — no tool use needed.
 func buildSamplingHandler(claude *llm.Claude) func(context.Context, *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
 	return func(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
 		params := req.Params
@@ -133,7 +165,7 @@ func buildSamplingHandler(claude *llm.Claude) func(context.Context, *mcp.CreateM
 		for i, m := range params.Messages {
 			tc, ok := m.Content.(*mcp.TextContent)
 			if !ok {
-				return nil, fmt.Errorf("sampling: message %d content type %T unsupported (Phase 3 = text only)", i, m.Content)
+				return nil, fmt.Errorf("sampling: message %d content type %T unsupported (text only)", i, m.Content)
 			}
 			switch m.Role {
 			case mcp.Role("user"):
@@ -161,43 +193,18 @@ func buildSamplingHandler(claude *llm.Claude) func(context.Context, *mcp.CreateM
 	}
 }
 
-// buildElicitationHandler returns an ElicitationHandler that bridges
-// MCP elicit requests to the SSE stream attached to the calling context.
+// buildInteractiveElicitHandler returns an ElicitationHandler that pushes
+// "input-required" events to the captured stream and blocks until the
+// peer responds via /messages:respond with the matching correlation ID.
 //
-// Behaviour matrix:
-//
-//	stream present (streaming endpoint) → push "input-required" event,
-//	                                       block on peer reply channel,
-//	                                       return decoded ElicitResult.
-//	stream absent (sync /messages call) → deterministic policy:
-//	                                       bootstrap (create=bool) → accept create
-//	                                       duplicate (choice=enum)  → decline
-//	                                       other schemas            → decline
-//
-// Policy fallback rationale:
-//   - Bootstrap is safe to auto-accept: empty Qdrant collection has no
-//     content risk. Matches the doc-writer-mcp server-side default.
-//   - Duplicate auto-decline avoids silent data loss. Caller (Claude
-//     agent) sees the decline and can re-ask the user explicitly.
-//
-// Timeout: ElicitTimeout bounds the wait so a disconnected peer doesn't
-// pin an MCP call forever.
-func buildElicitationHandler(pending *elicit.PendingRegistry) func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+// The stream is captured by closure — each call to this builder produces
+// a handler bound to one specific stream, used by exactly one
+// /messages:stream request. Concurrent streams get independent handlers.
+func buildInteractiveElicitHandler(pending *elicit.PendingRegistry, stream *elicit.Stream) func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 	return func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 		params := req.Params
 		if params == nil {
 			return nil, fmt.Errorf("elicit: nil params")
-		}
-
-		// Look up the active stream via the registry, not via ctx.
-		// MCP SDK invokes elicit handlers from a background JSON-RPC
-		// dispatcher whose ctx is the transport's, NOT the ctx the caller
-		// passed to CallTool. ctx-plumbing fundamentally cannot reach
-		// across that boundary; the registry's atomic pointer does.
-		stream, hasStream := pending.ActiveStream()
-		if !hasStream {
-			log.Printf("[elicit] no active SSE stream — applying policy fallback for message=%q", truncate(params.Message, 80))
-			return policyDecision(params), nil
 		}
 
 		cid, ch, unregister := pending.Register()
@@ -230,20 +237,36 @@ func buildElicitationHandler(pending *elicit.PendingRegistry) func(context.Conte
 	}
 }
 
-// policyDecision returns the deterministic auto-decision used when no SSE
-// stream is attached. Distinguishes bootstrap (single bool field) from
-// duplicate (single enum string) by inspecting the schema shape.
+// buildPolicyElicitHandler returns an ElicitationHandler that applies a
+// deterministic policy without consulting any peer. Used by the shared
+// session (sync /messages endpoint) where there is nobody to ask.
+//
+// Policy:
+//   - bootstrap (single bool field "create")  → accept create=true
+//   - duplicate (single enum field "choice")  → decline
+//   - any other schema                          → decline
+//
+// Bootstrap is safe to auto-accept: creating an empty Qdrant collection
+// has no content risk. Duplicate auto-decline avoids silent data loss —
+// caller (Claude agent) sees the decline and can re-ask the user.
+func buildPolicyElicitHandler() func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+	return func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		params := req.Params
+		if params == nil {
+			return nil, fmt.Errorf("elicit: nil params")
+		}
+		log.Printf("[elicit:policy] msg=%q", truncate(params.Message, 80))
+		return policyDecision(params), nil
+	}
+}
+
 func policyDecision(params *mcp.ElicitParams) *mcp.ElicitResult {
-	// Bootstrap collection prompts have schema property "create" (bool).
-	// Duplicate-action prompts have property "choice" (enum string).
 	if schemaHasProperty(params.RequestedSchema, "create") {
 		return &mcp.ElicitResult{
 			Action:  "accept",
 			Content: map[string]any{"create": true},
 		}
 	}
-	// Default: decline. Includes duplicate-action where silent auto-accept
-	// would risk data loss / churn.
 	return &mcp.ElicitResult{Action: "decline"}
 }
 

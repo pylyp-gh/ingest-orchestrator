@@ -54,7 +54,11 @@ func run() error {
 
 	pending := elicit.NewPendingRegistry()
 
-	mc, err := mcpclient.New(ctx, claude, pending)
+	// Shared MCP client used by the sync /messages handler. Its Elicitation
+	// handler uses the policy fallback — no peer SSE stream to ask. For
+	// /messages:stream we spin up a per-request session whose Elicitation
+	// handler captures the request's stream by closure.
+	mc, err := mcpclient.New(ctx, claude)
 	if err != nil {
 		return fmt.Errorf("init mcp client: %w", err)
 	}
