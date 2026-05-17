@@ -1,0 +1,32 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Builds
+/orchestrator
+/dist
+
+# Logs
+*.log
+
+# Editors
+.vscode/
+.idea/
+
+# Local secrets / env overrides
+.env
+.env.local
+.env.*.local
+
+# Docker
+.dockerignore
