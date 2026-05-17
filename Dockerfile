@@ -1,6 +1,6 @@
-# Build stage — pinned Go 1.25 to match go.mod requirements (mcp SDK v1.6.0+
-# uses 1.25 features). Multistage to keep the final image distroless-small.
-FROM golang:1.25-alpine AS builder
+# Build stage — pinned Go 1.26 to match go.mod requirements. Multistage to
+# keep the final image distroless-small.
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
