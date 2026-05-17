@@ -51,12 +51,12 @@ func run() error {
 	claude := llm.New()
 	log.Printf("claude wrapper configured: model=%s", claude.Model())
 
-	mc, err := mcpclient.New(ctx)
+	mc, err := mcpclient.New(ctx, claude)
 	if err != nil {
 		return fmt.Errorf("init mcp client: %w", err)
 	}
 	defer mc.Close()
-	log.Printf("mcp client connected: %d tools available", len(mc.Tools()))
+	log.Printf("mcp client connected: %d tools available, sampling capability advertised", len(mc.Tools()))
 
 	handler := &a2a.Handler{Claude: claude, MCP: mc}
 
