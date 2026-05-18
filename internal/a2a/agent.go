@@ -30,20 +30,28 @@ import (
 // model round-trip + at most N tool calls.
 const maxIterations = 8
 
-const systemPrompt = `You are the Ingest Orchestrator, an A2A agent that helps users add documentation to a Qdrant vector database. You have one MCP tool: add_document.
+const systemPrompt = `You are the Ingest Orchestrator, an A2A agent that helps users add documentation to a Qdrant vector database. You have two ways to handle ingest requests:
 
-Your job:
-- When the user provides text to ingest, call add_document with the text verbatim. Do not rewrite, summarise, or paraphrase the user's content — the tool has its own quality gates (L0/L1/L2/L5 defence) that depend on the original text.
-- If the user passes a URL alongside the text, include it as sourceUrl.
-- After the tool returns, report back: the action taken (inserted/replaced/versioned/added_variant), the point ID, and any extracted metadata (title, tags, summary).
-- If the tool returns a soft error (e.g., "too short", "duplicate exists", "prompt-injection pattern"), explain why and suggest what the user can do (add more content, confirm overwrite explicitly, etc.).
+1. add_document (MCP tool, local) — call doc-writer-mcp yourself. Use when the user provides direct text and you want fine-grained control: see the action (inserted/replaced/versioned), point ID, and metadata in the tool result.
+
+2. delegate_to_writer_agent (A2A peer) — hand the whole ingest off to writer-agent, a kagent A2A peer that drives the same L0-L5 defence + Sampling + Elicitation pipeline end-to-end. Use when the user asks something open-ended ("add this", "store this knowledge") and you want writer-agent to own the full flow. You receive writer-agent's final natural-language response.
+
+Choosing between them: prefer add_document for crisp ingest tasks where you can frame the call cleanly; prefer delegate_to_writer_agent when the request is more conversational or you want to demonstrate cross-agent delegation. If unsure, default to add_document.
+
+For both tools:
+- Pass the user's text verbatim. Do not rewrite, summarise, or paraphrase — the quality gates downstream depend on the original text.
+- If the user passes a URL alongside the text, include it as sourceUrl (add_document only; delegate_to_writer_agent will detect URLs in the natural-language text).
+- If the tool returns a soft error or rejection, explain why and suggest what the user can do.
 - If the user asks something that isn't an ingest request, briefly explain what you do and ask them to provide text to ingest.
 - Reply in the language of the user.`
 
 // Loop runs the agent loop on the given user text, using the given Claude
-// and MCP clients. Returns the terminal text response.
+// and MCP clients. Returns the terminal text response. The tool list
+// presented to Claude is the union of MCP tools (add_document via
+// doc-writer-mcp) plus the delegate_to_writer_agent A2A meta-tool.
 func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, userText string) (string, error) {
 	tools := mcpToolsToOpenAI(mc.Tools())
+	tools = append(tools, peerToolDefinition())
 
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage(systemPrompt),
@@ -85,6 +93,20 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 		return fmt.Sprintf("error: failed to parse tool arguments JSON: %v (raw: %q)", err, call.Function.Arguments)
 	}
 	log.Printf("[agent] tool call: %s args=%s", name, call.Function.Arguments)
+
+	// Dispatch — A2A peer delegation routes outside MCP entirely.
+	if name == PeerToolName {
+		text, _ := args["text"].(string)
+		if text == "" {
+			return "error: delegate_to_writer_agent requires a non-empty 'text' argument"
+		}
+		out, err := invokeWriterAgent(ctx, text)
+		if err != nil {
+			return fmt.Sprintf("error from peer: %v", err)
+		}
+		return out
+	}
+
 	resp, err := mc.CallTool(ctx, name, args)
 	if err != nil {
 		return fmt.Sprintf("error: tool call failed: %v", err)
