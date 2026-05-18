@@ -26,6 +26,7 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/elicit"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
 )
 
 var (
@@ -65,7 +66,20 @@ func run() error {
 	defer mc.Close()
 	log.Printf("mcp client connected: %d tools available, sampling+elicitation capabilities advertised", len(mc.Tools()))
 
-	handler := &a2a.Handler{Claude: claude, MCP: mc}
+	// Auto-discover kagent A2A peers by listing Agent CRDs у kagent ns
+	// + fetching each peer's Agent Card. Replaces the hardcoded peer
+	// table that used to live in internal/a2a/peer.go.
+	discovery, err := peer.NewDiscovery(envOr("KAGENT_NAMESPACE", "kagent"))
+	if err != nil {
+		log.Printf("WARN: peer discovery init failed (%v) — tool list will be empty until in-cluster SA is reachable", err)
+	} else {
+		if err := discovery.Refresh(ctx); err != nil {
+			log.Printf("WARN: initial peer discovery refresh failed: %v", err)
+		}
+		go discovery.Run(ctx, 5*time.Minute)
+	}
+
+	handler := &a2a.Handler{Claude: claude, MCP: mc, Discovery: discovery}
 	streamHandler := &a2a.StreamingHandler{Handler: handler, Pending: pending}
 	respondHandler := &a2a.RespondHandler{Pending: pending}
 
@@ -135,6 +149,13 @@ func run() error {
 		defer cancel()
 		return srv.Shutdown(ctx)
 	}
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // logMiddleware — minimal request log. Future: replace with structured

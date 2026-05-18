@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
 )
 
 // SendMessageRequest mirrors the A2A spec request shape.
@@ -53,8 +54,9 @@ type Status struct {
 // and MCP client session. Constructed once at startup and reused across
 // requests (session reuse → connection keep-alive on both sides).
 type Handler struct {
-	Claude *llm.Claude
-	MCP    *mcpclient.Client
+	Claude    *llm.Claude
+	MCP       *mcpclient.Client
+	Discovery *peer.Discovery
 }
 
 // SendMessage is the A2A POST /messages handler. Drives the Claude agent
@@ -82,7 +84,7 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		History: []Message{req.Message},
 	}
 
-	answer, err := Loop(r.Context(), h.Claude, h.MCP, userText)
+	answer, err := Loop(r.Context(), h.Claude, h.MCP, h.Discovery, userText)
 	if err != nil {
 		task.Status = Status{
 			State:     "FAILED",

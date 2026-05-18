@@ -34,38 +34,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/shared"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
 )
 
 // PeerToolName is the OpenAI ChatCompletion tool name Claude sees and
 // invokes when it wants to delegate to any kagent A2A peer.
 const PeerToolName = "delegate_to_kagent_peer"
 
-// kagentPeers — known A2A peers in the cluster, surfaced to Claude as
-// the enum of agent_name. Each entry describes the peer's domain so
-// Claude can route subtasks to the right specialist. Endpoints resolve
-// via in-cluster DNS (writer-agent.kagent.svc.cluster.local:8080).
-//
-// To add a peer: append here, redeploy. No system prompt change needed
-// — the description below is part of the tool definition Claude reads.
-var kagentPeers = []struct {
-	Name        string
-	Description string
-}{
-	{"writer-agent", "Documentation ingest — adds text to the Qdrant vector DB via the L0-L5 defence pipeline. Use for 'add this knowledge', 'store this doc'."},
-	{"doc-agent", "Documentation query — reads from Qdrant. Use for 'find docs about X', 'what do we have on Y'."},
-	{"k8s-agent", "Kubernetes cluster operations — kubectl-equivalent queries about resources, pods, services, deployments. Use for 'show me the running pods', 'what's the state of X', 'describe Y'."},
-	{"helm-agent", "Helm chart operations — list releases, inspect values, troubleshoot installs. Use for 'what charts are installed', 'check release X status'."},
-	{"istio-agent", "Istio service mesh queries — virtual services, gateways, destination rules. Use for service-mesh diagnostics."},
-	{"observability-agent", "Logs + metrics inspection — Prometheus queries, log searches. Use for 'find errors in X', 'show CPU for Y'."},
-	{"promql-agent", "PromQL query construction + execution. Use when user asks for a specific metric or wants help writing a query."},
-}
-
 // peerEndpoint computes the in-cluster URL for the named kagent agent.
-// All kagent Agent CRDs reconcile to a Service of the same name in the
-// `kagent` namespace listening on :8080 — pattern owned by kagent.
+// Discovery already resolves these; this helper exists for the legacy
+// WRITER_AGENT_A2A_URL env override (kept for backwards compat with the
+// pre-discovery iteration of Lab 4 макс).
 func peerEndpoint(agentName string) string {
-	// Allow per-deploy override only for writer-agent (legacy env, kept
-	// for backward compatibility with earlier Lab 4 макс iteration).
 	if agentName == "writer-agent" {
 		if v := os.Getenv("WRITER_AGENT_A2A_URL"); v != "" {
 			return v
@@ -74,15 +54,20 @@ func peerEndpoint(agentName string) string {
 	return fmt.Sprintf("http://%s.kagent.svc.cluster.local:8080/", agentName)
 }
 
-// peerToolDefinition builds the OpenAI tool description Claude sees.
-// Enum + per-peer description drives task routing. Made a builder
-// rather than a package var to avoid map-aliasing surprises.
-func peerToolDefinition() openai.ChatCompletionToolParam {
-	enumValues := make([]string, len(kagentPeers))
-	descriptions := "Available peers:\n"
-	for i, p := range kagentPeers {
-		enumValues[i] = p.Name
+// peerToolDefinition builds the OpenAI tool description Claude sees,
+// driven by the live peer list discovered from the cluster. Enum +
+// per-peer description (each fetched from peer's own Agent Card)
+// drives task routing. Rebuilt per Loop call so Claude always sees
+// current cluster state.
+func peerToolDefinition(peers []peer.Peer) openai.ChatCompletionToolParam {
+	enumValues := make([]string, 0, len(peers))
+	descriptions := "Available peers (auto-discovered from kagent Agent CRDs + each peer's Agent Card):\n"
+	for _, p := range peers {
+		enumValues = append(enumValues, p.Name)
 		descriptions += fmt.Sprintf("  - %s: %s\n", p.Name, p.Description)
+	}
+	if len(peers) == 0 {
+		descriptions += "  (no peers currently reachable — check kagent ns or wait for refresh)\n"
 	}
 
 	return openai.ChatCompletionToolParam{

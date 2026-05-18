@@ -23,6 +23,7 @@ import (
 	"github.com/openai/openai-go/shared"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
 )
 
 // maxIterations bounds the tool-use loop to prevent runaway behaviour
@@ -54,10 +55,15 @@ Reply in the language of the user. If a peer returns an error, explain what happ
 // Loop runs the agent loop on the given user text, using the given Claude
 // and MCP clients. Returns the terminal text response. The tool list
 // presented to Claude is the union of MCP tools (add_document via
-// doc-writer-mcp) plus the delegate_to_writer_agent A2A meta-tool.
-func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, userText string) (string, error) {
+// doc-writer-mcp) plus the delegate_to_kagent_peer A2A meta-tool whose
+// enum is built from the live kagent peer list.
+func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discovery *peer.Discovery, userText string) (string, error) {
 	tools := mcpToolsToOpenAI(mc.Tools())
-	tools = append(tools, peerToolDefinition())
+	var peers []peer.Peer
+	if discovery != nil {
+		peers = discovery.Peers()
+	}
+	tools = append(tools, peerToolDefinition(peers))
 
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage(systemPrompt),
