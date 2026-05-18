@@ -146,8 +146,11 @@ type jsonRPCResponse struct {
 
 // invokeKagentPeer sends an A2A message/send JSON-RPC call to the
 // named kagent agent and returns the concatenated artifact text.
-// Caller-side timeout = 90s (kagent agents' full pipelines can take
-// 60-70s with MCP CallTool + Sampling + final Claude completion).
+// Caller-side timeout = 180s — doc-agent / observability-agent paths
+// can chain Qdrant cosine search + Ollama embeddings + multiple Claude
+// completions, totalling 90-120s. Generous bound prevents premature
+// retries; the upstream orchestrator already has its own request-level
+// budget to terminate stuck delegations.
 func invokeKagentPeer(ctx context.Context, agentName, userText string) (string, error) {
 	endpoint := peerEndpoint(agentName)
 	req := jsonRPCRequest{
@@ -169,7 +172,7 @@ func invokeKagentPeer(ctx context.Context, agentName, userText string) (string, 
 		return "", fmt.Errorf("peer: marshal request: %w", err)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, endpoint, bytes.NewReader(body))

@@ -97,7 +97,7 @@ func run() error {
 		Addr:              *httpAddr,
 		Handler:           logMiddleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      120 * time.Second, // long enough for LLM round-trips
+		WriteTimeout:      600 * time.Second, // long enough for multi-agent team coordination (up to 4 peer delegations + final synthesis)
 		IdleTimeout:       60 * time.Second,
 	}
 
