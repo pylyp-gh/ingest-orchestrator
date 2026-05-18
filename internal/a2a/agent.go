@@ -30,20 +30,26 @@ import (
 // model round-trip + at most N tool calls.
 const maxIterations = 8
 
-const systemPrompt = `You are the Ingest Orchestrator, an A2A agent that helps users add documentation to a Qdrant vector database. You have two ways to handle ingest requests:
+const systemPrompt = `You are the Ingest Orchestrator, an A2A team coordinator. You decompose user requests into subtasks and route them to either your own MCP tool (add_document) or to specialised kagent A2A peers via delegate_to_kagent_peer.
 
-1. add_document (MCP tool, local) — call doc-writer-mcp yourself. Use when the user provides direct text and you want fine-grained control: see the action (inserted/replaced/versioned), point ID, and metadata in the tool result.
+Your toolbelt:
 
-2. delegate_to_writer_agent (A2A peer) — hand the whole ingest off to writer-agent, a kagent A2A peer that drives the same L0-L5 defence + Sampling + Elicitation pipeline end-to-end. Use when the user asks something open-ended ("add this", "store this knowledge") and you want writer-agent to own the full flow. You receive writer-agent's final natural-language response.
+1. add_document (MCP tool, local) — call doc-writer-mcp yourself. Use when the user provides direct text and you want fine-grained control (you see the action taken, point ID, metadata in the tool result).
 
-Choosing between them: prefer add_document for crisp ingest tasks where you can frame the call cleanly; prefer delegate_to_writer_agent when the request is more conversational or you want to demonstrate cross-agent delegation. If unsure, default to add_document.
+2. delegate_to_kagent_peer (A2A) — invoke any kagent peer agent by name. See the tool description for the list of available peers and what each does. Use this to:
+   - Hand off a single subtask to a specialist (e.g. k8s-agent for cluster queries)
+   - Decompose a complex multi-domain request into parallel delegations (multiple tool_calls in one turn) and aggregate the results yourself
 
-For both tools:
-- Pass the user's text verbatim. Do not rewrite, summarise, or paraphrase — the quality gates downstream depend on the original text.
-- If the user passes a URL alongside the text, include it as sourceUrl (add_document only; delegate_to_writer_agent will detect URLs in the natural-language text).
-- If the tool returns a soft error or rejection, explain why and suggest what the user can do.
-- If the user asks something that isn't an ingest request, briefly explain what you do and ask them to provide text to ingest.
-- Reply in the language of the user.`
+Team-coordination guidance:
+- Read the user's request and identify how many distinct domains it touches (docs ingest, cluster inspection, helm releases, observability, mesh diagnostics).
+- For each distinct domain, choose the right peer from delegate_to_kagent_peer's enum.
+- If the request is single-domain, just invoke one tool/peer.
+- If the request spans multiple domains, fire multiple delegate_to_kagent_peer calls in one turn (tool_choice will execute them all), then synthesise the peer replies into a single coherent answer for the user.
+- Don't re-summarise inside add_document or delegate_to_kagent_peer calls — pass the user's text verbatim. Quality gates and the peers' own LLMs depend on the original phrasing.
+
+If the request is purely about ingesting one document, you can use add_document directly (faster, no extra hop). If you want a writer-agent demo or the request is conversational ("save this thought"), delegate.
+
+Reply in the language of the user. If a peer returns an error, explain what happened and suggest a recovery (e.g. "retry without the URL", "shorten the text", "the L5 gate is currently blocking — try ENABLE_SAMPLING=false on the doc-writer-mcp server").`
 
 // Loop runs the agent loop on the given user text, using the given Claude
 // and MCP clients. Returns the terminal text response. The tool list
@@ -96,13 +102,14 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 
 	// Dispatch — A2A peer delegation routes outside MCP entirely.
 	if name == PeerToolName {
+		agentName, _ := args["agent_name"].(string)
 		text, _ := args["text"].(string)
-		if text == "" {
-			return "error: delegate_to_writer_agent requires a non-empty 'text' argument"
+		if agentName == "" || text == "" {
+			return "error: delegate_to_kagent_peer requires non-empty 'agent_name' and 'text' arguments"
 		}
-		out, err := invokeWriterAgent(ctx, text)
+		out, err := invokeKagentPeer(ctx, agentName, text)
 		if err != nil {
-			return fmt.Sprintf("error from peer: %v", err)
+			return fmt.Sprintf("error from peer %s: %v", agentName, err)
 		}
 		return out
 	}
