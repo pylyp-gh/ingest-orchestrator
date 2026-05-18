@@ -172,9 +172,7 @@
       <textarea id="prompt" placeholder="Введи запит. Claude обере відповідні tools / peers і decompose-ить задачу."></textarea>
       <div class="controls">
         <button type="submit" id="submit">Send</button>
-        <a class="example" id="ex1">приклад: cluster status</a>
-        <a class="example" id="ex2">приклад: multi-agent meta-analysis</a>
-        <a class="example" id="ex3">приклад: ingest delegate</a>
+        <span id="examples-container" style="display: contents;"></span>
       </div>
     </form>
 
@@ -196,15 +194,33 @@
     const responseEl = document.getElementById('response');
     const metaEl = document.getElementById('meta');
 
-    document.getElementById('ex1').onclick = () => {
-      promptEl.value = "Запитай k8s-agent скільки pods running у namespace kagent зараз і коротко опиши стан.";
-    };
-    document.getElementById('ex2').onclick = () => {
-      promptEl.value = "Дослідь нашу інфраструктуру і документацію. 1) k8s-agent: повний стан кластеру (namespaces, agents, services). 2) helm-agent: всі helm releases. 3) doc-agent: що описано у Qdrant колекції kagent-flux-lab. Потім cross-reference: знайди gaps (що running але не documented, або documented але не running).";
-    };
-    document.getElementById('ex3').onclick = () => {
-      promptEl.value = "Делегуй writer-agent додавання цього документа: A2A protocol дозволяє агентам спілкуватись через JSON-RPC message/send method з Agent Card discovery на /.well-known/agent-card.json.";
-    };
+    // Fetch examples from Agent Card per A2A spec (AgentSkill.examples[])
+    // — single source of truth lives in agentcard.go. UI renders dynamically.
+    (async () => {
+      try {
+        const resp = await fetch('/.well-known/agent-card.json');
+        const card = await resp.json();
+        const container = document.getElementById('examples-container');
+        const seen = new Set();
+        for (const skill of card.skills || []) {
+          for (const ex of skill.examples || []) {
+            // Truncate label, keep full text on click
+            const label = ex.length > 50 ? ex.slice(0, 50) + '…' : ex;
+            const key = ex.slice(0, 30);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const a = document.createElement('a');
+            a.className = 'example';
+            a.textContent = `${skill.id}: ${label}`;
+            a.title = ex; // hover shows full
+            a.onclick = () => { promptEl.value = ex; };
+            container.appendChild(a);
+          }
+        }
+      } catch (err) {
+        console.warn('Could not load examples from Agent Card:', err);
+      }
+    })();
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
