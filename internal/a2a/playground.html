@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A2A Playground — ingest-orchestrator</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --surface-2: #334155;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0ea5e9;
+      --border: #475569;
+      --success: #4ade80;
+      --error: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+    .container { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
+    header { margin-bottom: 24px; }
+    h1 { font-size: 28px; margin: 0 0 8px; color: var(--accent); }
+    .subtitle { color: var(--muted); font-size: 14px; }
+    .subtitle code {
+      background: var(--surface);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .agent-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 24px;
+      font-size: 13px;
+    }
+    .agent-card .label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .agent-card .value { color: var(--text); margin-bottom: 12px; }
+    .agent-card .value:last-child { margin-bottom: 0; }
+    .peers {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .peer-badge {
+      background: var(--surface-2);
+      color: var(--accent);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    form { margin-bottom: 24px; }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      padding: 12px;
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 14px;
+      resize: vertical;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      margin-top: 12px;
+      align-items: center;
+    }
+    button {
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .example {
+      color: var(--muted);
+      font-size: 12px;
+      cursor: pointer;
+      text-decoration: underline dashed;
+      text-underline-offset: 3px;
+    }
+    .example:hover { color: var(--text); }
+    .response {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 100px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .response.loading::before {
+      content: "⏳ ";
+    }
+    .response.error { border-color: var(--error); color: var(--error); }
+    .response.success { border-color: var(--success); }
+    .meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 8px;
+      font-family: monospace;
+    }
+    .footer {
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>A2A Playground</h1>
+      <p class="subtitle">
+        Інтерактивне тестування ingest-orchestrator через A2A protocol.
+        Browser POSTs до <code>/messages</code> — той самий endpoint що external peers.
+      </p>
+    </header>
+
+    <div class="agent-card">
+      <div class="label">Agent</div>
+      <div class="value"><strong>ingest-orchestrator</strong> — A2A team coordinator</div>
+      <div class="label">Capabilities</div>
+      <div class="value">add_document (MCP) + delegate_to_kagent_peer (A2A) → 7 peers:</div>
+      <div class="peers">
+        <span class="peer-badge">writer-agent</span>
+        <span class="peer-badge">doc-agent</span>
+        <span class="peer-badge">k8s-agent</span>
+        <span class="peer-badge">helm-agent</span>
+        <span class="peer-badge">istio-agent</span>
+        <span class="peer-badge">observability-agent</span>
+        <span class="peer-badge">promql-agent</span>
+      </div>
+    </div>
+
+    <form id="form">
+      <textarea id="prompt" placeholder="Введи запит. Claude обере відповідні tools / peers і decompose-ить задачу."></textarea>
+      <div class="controls">
+        <button type="submit" id="submit">Send</button>
+        <a class="example" id="ex1">приклад: cluster status</a>
+        <a class="example" id="ex2">приклад: multi-agent meta-analysis</a>
+        <a class="example" id="ex3">приклад: ingest delegate</a>
+      </div>
+    </form>
+
+    <div class="response" id="response">Тут з'явиться відповідь...</div>
+    <div class="meta" id="meta"></div>
+
+    <div class="footer">
+      Lab 4 — fwdays:AIRe |
+      <a href="/.well-known/agent-card.json" target="_blank">Agent Card</a> |
+      <a href="https://github.com/pylyp-gh/ingest-orchestrator" target="_blank">Source</a> |
+      <a href="https://a2a-protocol.org" target="_blank">A2A spec</a>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('form');
+    const promptEl = document.getElementById('prompt');
+    const submitBtn = document.getElementById('submit');
+    const responseEl = document.getElementById('response');
+    const metaEl = document.getElementById('meta');
+
+    document.getElementById('ex1').onclick = () => {
+      promptEl.value = "Запитай k8s-agent скільки pods running у namespace kagent зараз і коротко опиши стан.";
+    };
+    document.getElementById('ex2').onclick = () => {
+      promptEl.value = "Дослідь нашу інфраструктуру і документацію. 1) k8s-agent: повний стан кластеру (namespaces, agents, services). 2) helm-agent: всі helm releases. 3) doc-agent: що описано у Qdrant колекції kagent-flux-lab. Потім cross-reference: знайди gaps (що running але не documented, або documented але не running).";
+    };
+    document.getElementById('ex3').onclick = () => {
+      promptEl.value = "Делегуй writer-agent додавання цього документа: A2A protocol дозволяє агентам спілкуватись через JSON-RPC message/send method з Agent Card discovery на /.well-known/agent-card.json.";
+    };
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = promptEl.value.trim();
+      if (!text) return;
+
+      submitBtn.disabled = true;
+      responseEl.className = 'response loading';
+      responseEl.textContent = 'Orchestrator думає... (може зайняти кілька хвилин для multi-agent decomposition)';
+      metaEl.textContent = '';
+
+      const start = Date.now();
+      try {
+        const resp = await fetch('/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: {
+              role: 'user',
+              content: [{ type: 'text', text: text }]
+            }
+          })
+        });
+
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        const data = await resp.json();
+
+        if (data.status && data.status.state === 'COMPLETED') {
+          const agentReply = data.history && data.history[data.history.length - 1];
+          const replyText = agentReply && agentReply.content && agentReply.content[0] && agentReply.content[0].text;
+          responseEl.className = 'response success';
+          responseEl.textContent = replyText || '(empty response)';
+          metaEl.textContent = `Task ${data.id || '?'} — ${elapsed}s — ${data.history ? data.history.length : 0} messages`;
+        } else if (data.status && data.status.state === 'FAILED') {
+          responseEl.className = 'response error';
+          responseEl.textContent = data.status.message || 'Task failed';
+          metaEl.textContent = `Task ${data.id || '?'} — ${elapsed}s`;
+        } else {
+          responseEl.className = 'response';
+          responseEl.textContent = JSON.stringify(data, null, 2);
+          metaEl.textContent = `${elapsed}s`;
+        }
+      } catch (err) {
+        responseEl.className = 'response error';
+        responseEl.textContent = 'Помилка: ' + err.message;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

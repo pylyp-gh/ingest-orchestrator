@@ -73,6 +73,18 @@ func run() error {
 	// the canonical entry point for peers to learn about the agent.
 	mux.HandleFunc("/.well-known/agent-card.json", agentcard.Handler())
 
+	// Browser playground for interactive A2A testing — single-page HTML з
+	// embedded form + JS, POSTs до /messages. Same-origin so no CORS.
+	mux.HandleFunc("/ui", a2a.PlaygroundHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Friendly root: redirect bare browser visits to /ui rather than 404.
+		if r.URL.Path == "/" && r.Method == http.MethodGet {
+			http.Redirect(w, r, "/ui", http.StatusFound)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
 	// A2A SendMessage (sync) — drives the Claude tool-use loop. Elicit
 	// requests during execution fall back to policy decisions (no SSE
 	// channel to push prompts on).
