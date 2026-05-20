@@ -11,6 +11,54 @@
 //
 // Same pattern as kagent's claude-via-gateway ModelConfig — single source
 // of truth for the gateway path and translation rules.
+//
+// TODO(open question): архітектурний gap навколо 4xx-driven fallback.
+//
+//   Поточний стан:
+//     * Client-side retry на 4xx (Complete() falls back to Ollama if
+//       OLLAMA_FALLBACK_URL set). Це fix для orchestrator's own LLM
+//       calls, але peers (kagent agents: k8s-agent, helm-agent,
+//       doc-agent, observability-agent, etc.) не мають analogous
+//       fallback — їх ModelConfig is single-provider, ADK code не
+//       робить retry. На credit-burn:
+//
+//         orchestrator.LLM → 400 → Ollama fallback ✓
+//             ↓ delegate_to_kagent_peer
+//             peer.LLM → 400 → no fallback → peer returns error
+//             ↓
+//             orchestrator.LLM (Ollama) бачить error, often outputs
+//             free-form prose замість structured tool_calls retry.
+//
+//   Що ми вже спробували і чому не покращує:
+//     * agentgateway `AgentgatewayBackend.spec.ai.groups[]` — failover
+//       lights up тільки на provider-side infra failure (5xx/timeout),
+//       не на AI-level 4xx like credit_balance_too_low. Confirmed via
+//       gateway logs — retry attempts hit same group, eventually surface
+//       400 to caller.
+//     * `HTTPRoute.spec.rules[].retry` з codes=[400] — gateway re-issues
+//       to same backend group, не cross-group. Wasted 3x latency, same
+//       result.
+//
+//   Можливі шляхи розв'язання:
+//     1. Підняти upstream feature request у agentgateway: declarative
+//        4xx-failover codes per backend (groups[].failoverCodes:
+//        [400, 402, 429] etc.). Дозволяє єдиний YAML knob для всіх
+//        consumers — peers, orchestrator, sample_client — одночасно.
+//        Hardest у часі, але правильний шар.
+//     2. Switch primary provider до Ollama локально для всіх kagent
+//        peers + orchestrator. ModelConfig change в kagent ns
+//        (provider.openai з host=ollama.svc.cluster.local). Втрачаємо
+//        Claude tool-use quality (~15-20%), але стек з нульовою cost
+//        dependency. Pragmatic для lab demos.
+//     3. Sidecar pattern — small Go shim sitting між кожним agent's pod
+//        і agentgateway, що catches 4xx і retries against alternate
+//        backend. Same logic як наш Complete() але externalised. Heavy.
+//     4. Wait for Anthropic credit auto-replenishment / Plan upgrade.
+//        Не fix, just delays the problem.
+//
+//   Поки що: orchestrator survives credit-burn (degraded mode), peers
+//   ні. Це **known limitation** документоване у trace tree як missing
+//   spans (peer delegation returns error, не traced subtree).
 package llm
 
 import (
