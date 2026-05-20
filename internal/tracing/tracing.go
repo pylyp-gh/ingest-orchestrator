@@ -100,6 +100,21 @@ func SetKind(span trace.Span, kind string) {
 	span.SetAttributes(attribute.String("openinference.span.kind", kind))
 }
 
+// SafeTrunc clamps a string to `max` runes (NOT bytes) and appends "…"
+// when trimmed. Byte-level slicing у Go (`s[:n]`) can split a multi-byte
+// UTF-8 codepoint mid-sequence — coли the resulting invalid UTF-8 lands
+// у an OTel span attribute, OTLP gRPC export fails з "string field
+// contains invalid UTF-8" і the whole batch is dropped. Always run
+// untrusted strings (LLM outputs, peer responses) through this before
+// span attribution.
+func SafeTrunc(s string, max int) string {
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s
+	}
+	return string(rs[:max]) + "…"
+}
+
 // EndWithErr finalises a span, marking status=Error when err != nil
 // and recording the error як an event. Use в defer:
 //

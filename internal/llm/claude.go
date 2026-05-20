@@ -126,12 +126,11 @@ func (c *Claude) Complete(
 	)
 	if msgsJSON, jerr := json.Marshal(messages); jerr == nil {
 		// Cap aggressively — full message history з system prompt can
-		// be 5-10KB, eats span budget and clutters Phoenix UI.
-		s := string(msgsJSON)
-		if len(s) > 2000 {
-			s = s[:2000] + "…"
-		}
-		span.SetAttributes(attribute.String("input.value", s))
+		// be 5-10KB, eats span budget and clutters Phoenix UI. Use
+		// rune-aware truncation so we don't split a multi-byte UTF-8
+		// codepoint and break OTLP gRPC marshaling.
+		span.SetAttributes(attribute.String("input.value",
+			tracing.SafeTrunc(string(msgsJSON), 2000)))
 	}
 
 	params := openai.ChatCompletionNewParams{
@@ -194,10 +193,9 @@ func (c *Claude) Complete(
 	if out == "" && len(resp.Choices[0].Message.ToolCalls) > 0 {
 		out = "(tool_calls; no plain text)"
 	}
-	if len(out) > 480 {
-		out = out[:480] + "…"
-	}
-	span.SetAttributes(attribute.String("output.value", out))
+	// Ollama qwen output can contain CJK characters when fallback fires —
+	// rune-aware truncation is mandatory here.
+	span.SetAttributes(attribute.String("output.value", tracing.SafeTrunc(out, 480)))
 	span.End()
 	return &resp.Choices[0].Message, nil
 }

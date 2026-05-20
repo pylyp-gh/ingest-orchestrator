@@ -115,12 +115,12 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 	return "", err
 }
 
-// truncate clamps a string до n чарів, додаючи `…` коли trimmed.
+// truncate clamps a string до n runes (NOT bytes) — byte-level slicing
+// would split a multi-byte UTF-8 codepoint and crash OTLP export з
+// "string field contains invalid UTF-8". Delegates to tracing.SafeTrunc
+// so we have one source of truth у the codebase.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
+	return tracing.SafeTrunc(s, n)
 }
 
 // executeToolCall invokes the named MCP tool with the JSON arguments from
