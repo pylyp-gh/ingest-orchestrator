@@ -27,7 +27,22 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/tracing"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
+
+// extractTraceContext — server-side propagation middleware. Same pattern
+// as doc-writer-mcp: лиш extract incoming traceparent, не emit HTTP-level
+// span. Keeps agent.loop / claude / tool.call spans як top-level under
+// the caller's trace, without polluting Phoenix з HTTP-hop noise.
+func extractTraceContext(next http.Handler) http.Handler {
+	propagator := otel.GetTextMapPropagator()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 var (
 	httpAddr = flag.String("http", ":8080", "HTTP listen address")
@@ -49,6 +64,19 @@ func run() error {
 	// constructed once and reused across requests for connection keep-alive.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// OTel tracing — exports OTLP gRPC до Phoenix коли
+	// OTEL_EXPORTER_OTLP_ENDPOINT is set, no-op otherwise.
+	shutdownTracer, err := tracing.Init(ctx, "ingest-orchestrator", "0.1.0")
+	if err != nil {
+		log.Printf("WARN: tracing init failed (%v) — continuing без telemetry", err)
+		shutdownTracer = func(context.Context) error { return nil }
+	}
+	defer func() {
+		shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		_ = shutdownTracer(shutdownCtx)
+	}()
 
 	claude := llm.New()
 	log.Printf("claude wrapper configured: model=%s", claude.Model())
@@ -121,7 +149,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              *httpAddr,
-		Handler:           logMiddleware(mux),
+		Handler:           extractTraceContext(logMiddleware(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      600 * time.Second, // long enough for multi-agent team coordination (up to 4 peer delegations + final synthesis)
 		IdleTimeout:       60 * time.Second,

@@ -24,6 +24,8 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/tracing"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // maxIterations bounds the tool-use loop to prevent runaway behaviour
@@ -57,13 +59,28 @@ Reply in the language of the user. If a peer returns an error, explain what happ
 // presented to Claude is the union of MCP tools (add_document via
 // doc-writer-mcp) plus the delegate_to_kagent_peer A2A meta-tool whose
 // enum is built from the live kagent peer list.
-func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discovery *peer.Discovery, userText string) (string, error) {
+func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discovery *peer.Discovery, userText string) (answer string, err error) {
+	ctx, rootSpan := tracing.Tracer().Start(ctx, "orchestrator.loop")
+	tracing.SetKind(rootSpan, tracing.KindAgent)
+	rootSpan.SetAttributes(
+		attribute.Int("user.text_length", len(userText)),
+		attribute.String("input.value", truncate(userText, 240)),
+	)
+	defer func() {
+		rootSpan.SetAttributes(attribute.String("output.value", truncate(answer, 480)))
+		tracing.EndWithErr(rootSpan, err)
+	}()
+
 	tools := mcpToolsToOpenAI(mc.Tools())
 	var peers []peer.Peer
 	if discovery != nil {
 		peers = discovery.Peers()
 	}
 	tools = append(tools, peerToolDefinition(peers))
+	rootSpan.SetAttributes(
+		attribute.Int("tools.count", len(tools)),
+		attribute.Int("peers.count", len(peers)),
+	)
 
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage(systemPrompt),
@@ -71,14 +88,17 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 	}
 
 	for i := 0; i < maxIterations; i++ {
-		assistant, err := claude.Complete(ctx, messages, tools)
-		if err != nil {
-			return "", fmt.Errorf("claude iteration %d: %w", i, err)
+		assistant, cerr := claude.Complete(ctx, messages, tools)
+		if cerr != nil {
+			err = fmt.Errorf("claude iteration %d: %w", i, cerr)
+			return "", err
 		}
 
 		// Terminal text — no tool calls → return immediately.
 		if len(assistant.ToolCalls) == 0 {
-			return assistant.Content, nil
+			rootSpan.SetAttributes(attribute.Int("loop.iterations", i+1))
+			answer = assistant.Content
+			return answer, nil
 		}
 
 		// Append assistant turn (with tool_calls) before sending tool results.
@@ -91,7 +111,16 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 		}
 	}
 
-	return "", fmt.Errorf("max iterations (%d) exceeded — Claude may be looping on tool calls", maxIterations)
+	err = fmt.Errorf("max iterations (%d) exceeded — Claude may be looping on tool calls", maxIterations)
+	return "", err
+}
+
+// truncate clamps a string до n чарів, додаючи `…` коли trimmed.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // executeToolCall invokes the named MCP tool with the JSON arguments from
@@ -100,29 +129,56 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 // and adjust strategy (e.g., "duplicate exists — ask user").
 func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.ChatCompletionMessageToolCall) string {
 	name := call.Function.Name
+
+	// Wrap entire tool dispatch у one span. Kind = AGENT для peer
+	// delegation (downstream A2A invocation has its own loop), TOOL
+	// otherwise. Set after we know the dispatch path below.
+	ctx, span := tracing.Tracer().Start(ctx, "tool.call."+name)
+	span.SetAttributes(
+		attribute.String("tool.name", name),
+		attribute.String("input.value", truncate(call.Function.Arguments, 480)),
+	)
+	defer span.End()
+
 	var args map[string]any
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return fmt.Sprintf("error: failed to parse tool arguments JSON: %v (raw: %q)", err, call.Function.Arguments)
+		tracing.SetKind(span, tracing.KindTool)
+		msg := fmt.Sprintf("error: failed to parse tool arguments JSON: %v (raw: %q)", err, call.Function.Arguments)
+		span.SetAttributes(attribute.String("output.value", msg))
+		tracing.EndWithErr(span, err)
+		return msg
 	}
 	log.Printf("[agent] tool call: %s args=%s", name, call.Function.Arguments)
 
 	// Dispatch — A2A peer delegation routes outside MCP entirely.
 	if name == PeerToolName {
+		tracing.SetKind(span, tracing.KindAgent)
 		agentName, _ := args["agent_name"].(string)
 		text, _ := args["text"].(string)
+		span.SetAttributes(attribute.String("a2a.peer.name", agentName))
 		if agentName == "" || text == "" {
-			return "error: delegate_to_kagent_peer requires non-empty 'agent_name' and 'text' arguments"
+			msg := "error: delegate_to_kagent_peer requires non-empty 'agent_name' and 'text' arguments"
+			span.SetAttributes(attribute.String("output.value", msg))
+			return msg
 		}
-		out, err := invokeKagentPeer(ctx, agentName, text)
-		if err != nil {
-			return fmt.Sprintf("error from peer %s: %v", agentName, err)
+		out, perr := invokeKagentPeer(ctx, agentName, text)
+		if perr != nil {
+			msg := fmt.Sprintf("error from peer %s: %v", agentName, perr)
+			span.SetAttributes(attribute.String("output.value", msg))
+			tracing.EndWithErr(span, perr)
+			return msg
 		}
+		span.SetAttributes(attribute.String("output.value", truncate(out, 480)))
 		return out
 	}
 
+	tracing.SetKind(span, tracing.KindTool)
 	resp, err := mc.CallTool(ctx, name, args)
 	if err != nil {
-		return fmt.Sprintf("error: tool call failed: %v", err)
+		msg := fmt.Sprintf("error: tool call failed: %v", err)
+		span.SetAttributes(attribute.String("output.value", msg))
+		tracing.EndWithErr(span, err)
+		return msg
 	}
 	// Concatenate text content blocks from the result.
 	var out string
@@ -137,6 +193,10 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 	if resp.IsError {
 		out = "error from tool: " + out
 	}
+	span.SetAttributes(
+		attribute.Bool("tool.is_error", resp.IsError),
+		attribute.String("output.value", truncate(out, 480)),
+	)
 	return out
 }
 
