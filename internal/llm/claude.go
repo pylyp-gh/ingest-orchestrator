@@ -65,6 +65,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 
@@ -137,6 +138,20 @@ func New() *Claude {
 	return c
 }
 
+// extractMessageText pulls the plain-text content out of an OpenAI
+// SDK ChatCompletionMessageParamUnion. Used by the prompt-caching path
+// to wrap the system message text у an Anthropic-shape cache_control
+// block. Only handles string content (system message у our case);
+// returns empty string for other shapes.
+func extractMessageText(msg openai.ChatCompletionMessageParamUnion) string {
+	if msg.OfSystem != nil {
+		if msg.OfSystem.Content.OfString.Valid() {
+			return msg.OfSystem.Content.OfString.Value
+		}
+	}
+	return ""
+}
+
 // isFallbackEligibleErr reports whether the openai-go SDK error is one
 // that we expect a different provider to succeed on. 4xx responses
 // = AI-level error (credit/auth/quota/validation) — different upstream
@@ -189,7 +204,44 @@ func (c *Claude) Complete(
 		params.Tools = tools
 	}
 
-	resp, err := c.primary.Chat.Completions.New(ctx, params)
+	// Optional prompt caching — opt-in via ENABLE_PROMPT_CACHE=true.
+	// Anthropic exposes ephemeral cache for system message + tools що
+	// drops cached-input cost ~10x. The OpenAI SDK on our wire doesn't
+	// model cache_control natively, so we inject markers via JSON-Set
+	// patches on the outgoing request body. agentgateway's
+	// OpenAI→Anthropic translator may or may not forward these
+	// unmodified — if it strips them, the call still succeeds (just
+	// без cache benefit), so це low-risk experiment.
+	var callOpts []option.RequestOption
+	if os.Getenv("ENABLE_PROMPT_CACHE") == "true" && len(messages) > 0 {
+		callOpts = append(callOpts,
+			// Anthropic beta gate для prompt caching feature.
+			option.WithHeader("anthropic-beta", "prompt-caching-2024-07-31"),
+			// Replace messages[0].content (system message) з array
+			// of typed blocks з cache_control marker.
+			option.WithJSONSet("messages.0.content", []map[string]any{
+				{
+					"type":          "text",
+					"text":          extractMessageText(messages[0]),
+					"cache_control": map[string]string{"type": "ephemeral"},
+				},
+			}),
+		)
+		// Mark the tools array як cacheable теж — tools schema rarely
+		// changes between iterations, so caching saves significant
+		// token-pricing on long agent loops.
+		if len(tools) > 0 {
+			// sjson path для last tool index — caches all tools up to
+			// that point. cache_control on last tool у array makes
+			// everything before it cacheable per Anthropic semantics.
+			lastIdx := fmt.Sprintf("tools.%d.cache_control", len(tools)-1)
+			callOpts = append(callOpts,
+				option.WithJSONSet(lastIdx, map[string]string{"type": "ephemeral"}),
+			)
+		}
+	}
+
+	resp, err := c.primary.Chat.Completions.New(ctx, params, callOpts...)
 	usedLabel := c.primaryLabel
 	usedModel := c.primaryModel
 
