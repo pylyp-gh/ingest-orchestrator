@@ -1,275 +1,442 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="uk">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>A2A Playground — ingest-orchestrator</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --surface: #1e293b;
-      --surface-2: #334155;
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --accent-hover: #0ea5e9;
-      --border: #475569;
-      --success: #4ade80;
-      --error: #f87171;
-    }
-    * { box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      margin: 0;
-      min-height: 100vh;
-      line-height: 1.5;
-    }
-    .container { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
-    header { margin-bottom: 24px; }
-    h1 { font-size: 28px; margin: 0 0 8px; color: var(--accent); }
-    .subtitle { color: var(--muted); font-size: 14px; }
-    .subtitle code {
-      background: var(--surface);
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-size: 13px;
-    }
-    .agent-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      margin-bottom: 24px;
-      font-size: 13px;
-    }
-    .agent-card .label {
-      color: var(--muted);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 4px;
-    }
-    .agent-card .value { color: var(--text); margin-bottom: 12px; }
-    .agent-card .value:last-child { margin-bottom: 0; }
-    .peers {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-    .peer-badge {
-      background: var(--surface-2);
-      color: var(--accent);
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-family: monospace;
-      font-size: 12px;
-    }
-    form { margin-bottom: 24px; }
-    textarea {
-      width: 100%;
-      min-height: 140px;
-      padding: 12px;
-      background: var(--surface);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      font-family: inherit;
-      font-size: 14px;
-      resize: vertical;
-    }
-    textarea:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    .controls {
-      display: flex;
-      gap: 12px;
-      margin-top: 12px;
-      align-items: center;
-    }
-    button {
-      background: var(--accent);
-      color: var(--bg);
-      border: none;
-      padding: 10px 24px;
-      border-radius: 8px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    button:hover { background: var(--accent-hover); }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .example {
-      color: var(--muted);
-      font-size: 12px;
-      cursor: pointer;
-      text-decoration: underline dashed;
-      text-underline-offset: 3px;
-    }
-    .example:hover { color: var(--text); }
-    .response {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      min-height: 100px;
-      white-space: pre-wrap;
-      word-wrap: break-word;
-      font-family: monospace;
-      font-size: 13px;
-      line-height: 1.6;
-    }
-    .response.loading::before {
-      content: "⏳ ";
-    }
-    .response.error { border-color: var(--error); color: var(--error); }
-    .response.success { border-color: var(--success); }
-    .meta {
-      color: var(--muted);
-      font-size: 11px;
-      margin-top: 8px;
-      font-family: monospace;
-    }
-    .footer {
-      margin-top: 32px;
-      padding-top: 16px;
-      border-top: 1px solid var(--border);
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .footer a { color: var(--accent); }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>A2A Playground</h1>
-      <p class="subtitle">
-        Інтерактивне тестування ingest-orchestrator через A2A protocol.
-        Browser POSTs до <code>/messages</code> — той самий endpoint що external peers.
-      </p>
-    </header>
-
-    <div class="agent-card">
-      <div class="label">Agent</div>
-      <div class="value"><strong>ingest-orchestrator</strong> — A2A team coordinator</div>
-      <div class="label">Capabilities</div>
-      <div class="value">add_document (MCP) + delegate_to_kagent_peer (A2A) → 7 peers:</div>
-      <div class="peers">
-        <span class="peer-badge">writer-agent</span>
-        <span class="peer-badge">doc-agent</span>
-        <span class="peer-badge">k8s-agent</span>
-        <span class="peer-badge">helm-agent</span>
-        <span class="peer-badge">istio-agent</span>
-        <span class="peer-badge">observability-agent</span>
-        <span class="peer-badge">promql-agent</span>
-      </div>
-    </div>
-
-    <form id="form">
-      <textarea id="prompt" placeholder="Введи запит. Claude обере відповідні tools / peers і decompose-ить задачу."></textarea>
-      <div class="controls">
-        <button type="submit" id="submit">Send</button>
-        <span id="examples-container" style="display: contents;"></span>
-      </div>
-    </form>
-
-    <div class="response" id="response">Тут з'явиться відповідь...</div>
-    <div class="meta" id="meta"></div>
-
-    <div class="footer">
-      Lab 4 — fwdays:AIRe |
-      <a href="/.well-known/agent-card.json" target="_blank">Agent Card</a> |
-      <a href="https://github.com/pylyp-gh/ingest-orchestrator" target="_blank">Source</a> |
-      <a href="https://a2a-protocol.org" target="_blank">A2A spec</a>
-    </div>
-  </div>
-
-  <script>
-    const form = document.getElementById('form');
-    const promptEl = document.getElementById('prompt');
-    const submitBtn = document.getElementById('submit');
-    const responseEl = document.getElementById('response');
-    const metaEl = document.getElementById('meta');
-
-    // Fetch examples from Agent Card per A2A spec (AgentSkill.examples[])
-    // — single source of truth lives in agentcard.go. UI renders dynamically.
-    (async () => {
-      try {
-        const resp = await fetch('/.well-known/agent-card.json');
-        const card = await resp.json();
-        const container = document.getElementById('examples-container');
-        const seen = new Set();
-        for (const skill of card.skills || []) {
-          for (const ex of skill.examples || []) {
-            // Truncate label, keep full text on click
-            const label = ex.length > 50 ? ex.slice(0, 50) + '…' : ex;
-            const key = ex.slice(0, 30);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            const a = document.createElement('a');
-            a.className = 'example';
-            a.textContent = `${skill.id}: ${label}`;
-            a.title = ex; // hover shows full
-            a.onclick = () => { promptEl.value = ex; };
-            container.appendChild(a);
-          }
-        }
-      } catch (err) {
-        console.warn('Could not load examples from Agent Card:', err);
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>A2A Playground — ingest-orchestrator</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --surface: #1e293b;
+        --surface-2: #334155;
+        --text: #f1f5f9;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --accent-hover: #0ea5e9;
+        --border: #475569;
+        --success: #4ade80;
+        --error: #f87171;
+        --user-bubble: #1e3a8a;
+        --agent-bubble: #1e293b;
       }
-    })();
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        margin: 0;
+        min-height: 100vh;
+        line-height: 1.55;
+      }
+      .container {
+        max-width: min(1400px, 95vw);
+        margin: 0 auto;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+      }
+      header { margin-bottom: 16px; }
+      h1 { font-size: 24px; margin: 0 0 6px; color: var(--accent); }
+      .subtitle { color: var(--muted); font-size: 13px; }
+      .subtitle code {
+        background: var(--surface);
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace;
+        font-size: 12px;
+      }
+      .agent-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 16px;
+        font-size: 13px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        align-items: center;
+      }
+      .agent-card .field { display: flex; flex-direction: column; gap: 2px; }
+      .agent-card .label {
+        color: var(--muted);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .peers { display: flex; flex-wrap: wrap; gap: 6px; }
+      .peer-badge {
+        background: var(--surface-2);
+        color: var(--accent);
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace;
+        font-size: 12px;
+      }
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const text = promptEl.value.trim();
-      if (!text) return;
+      /* ── Chat transcript ───────────────────────────────────── */
+      .chat {
+        flex: 1;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 8px 0;
+        margin-bottom: 12px;
+      }
+      .turn {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        max-width: 100%;
+      }
+      .turn.user { align-items: flex-end; }
+      .turn.agent { align-items: flex-start; }
+      .bubble {
+        max-width: 92%;
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace;
+        font-size: 13px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        overflow-wrap: anywhere;
+      }
+      .turn.user .bubble {
+        background: var(--user-bubble);
+        border-color: #3b82f6;
+        color: #dbeafe;
+      }
+      .turn.agent .bubble { background: var(--agent-bubble); }
+      .turn.agent.loading .bubble::before { content: "⏳ "; }
+      .turn.agent.error .bubble {
+        border-color: var(--error);
+        color: var(--error);
+      }
+      .turn.agent.success .bubble { border-color: var(--success); }
+      .meta {
+        color: var(--muted);
+        font-size: 10px;
+        font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace;
+      }
+      .placeholder {
+        color: var(--muted);
+        font-size: 13px;
+        text-align: center;
+        padding: 32px 16px;
+      }
 
-      submitBtn.disabled = true;
-      responseEl.className = 'response loading';
-      responseEl.textContent = 'Orchestrator думає... (може зайняти кілька хвилин для multi-agent decomposition)';
-      metaEl.textContent = '';
+      /* ── Composer ──────────────────────────────────────────── */
+      form {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border);
+      }
+      textarea {
+        width: 100%;
+        min-height: 80px;
+        max-height: 240px;
+        padding: 12px;
+        background: var(--surface);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace;
+        font-size: 13px;
+        resize: vertical;
+      }
+      textarea:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      button {
+        background: var(--accent);
+        color: var(--bg);
+        border: none;
+        padding: 8px 18px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: var(--surface-2);
+        color: var(--text);
+      }
+      button:hover { background: var(--accent-hover); }
+      button.secondary:hover { background: var(--border); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .examples {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-left: auto;
+      }
+      .example {
+        color: var(--muted);
+        font-size: 11px;
+        cursor: pointer;
+        text-decoration: underline dashed;
+        text-underline-offset: 3px;
+      }
+      .example:hover { color: var(--text); }
+      .hint {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .hint kbd {
+        background: var(--surface-2);
+        padding: 1px 6px;
+        border-radius: 3px;
+        font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace;
+        font-size: 10px;
+        border: 1px solid var(--border);
+      }
+      footer {
+        margin-top: 12px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 11px;
+      }
+      footer a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>A2A Playground</h1>
+        <p class="subtitle">
+          Інтерактивне тестування <strong>ingest-orchestrator</strong> через A2A protocol.
+          Browser POSTs до <code>/messages</code> — той самий endpoint що external peers.
+        </p>
+      </header>
 
-      const start = Date.now();
-      try {
-        const resp = await fetch('/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: {
-              role: 'user',
-              content: [{ type: 'text', text: text }]
+      <div class="agent-card">
+        <div class="field">
+          <span class="label">Agent</span>
+          <span><strong>ingest-orchestrator</strong> — A2A team coordinator</span>
+        </div>
+        <div class="field">
+          <span class="label">Tools</span>
+          <span>add_document (MCP) + delegate_to_kagent_peer (A2A) → 7 peers</span>
+        </div>
+        <div class="field" style="flex: 1; min-width: 240px;">
+          <span class="label">Peers</span>
+          <div class="peers">
+            <span class="peer-badge">writer-agent</span>
+            <span class="peer-badge">doc-agent</span>
+            <span class="peer-badge">k8s-agent</span>
+            <span class="peer-badge">helm-agent</span>
+            <span class="peer-badge">istio-agent</span>
+            <span class="peer-badge">observability-agent</span>
+            <span class="peer-badge">promql-agent</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat" id="chat">
+        <div class="placeholder" id="placeholder">
+          Conversation з'явиться тут. Кожен новий запит — нова task на сервері (stateless),
+          але історія тримається у браузері для контексту.
+        </div>
+      </div>
+
+      <form id="form">
+        <textarea
+          id="prompt"
+          placeholder="Введи запит. Claude обере відповідні tools / peers і decompose-ить задачу. (Cmd/Ctrl+Enter = Send)"
+        ></textarea>
+        <div class="controls">
+          <button type="submit" id="submit">Send</button>
+          <button type="button" id="clear" class="secondary" title="Очистити транскрипт">Clear</button>
+          <span class="hint">
+            <kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd> щоб надіслати
+          </span>
+          <span class="examples" id="examples"></span>
+        </div>
+      </form>
+
+      <footer>
+        <a href="/.well-known/agent-card.json" target="_blank">Agent Card</a> ·
+        <a href="https://github.com/pylyp-gh/ingest-orchestrator" target="_blank">Source</a> ·
+        <a href="https://a2a-protocol.org" target="_blank">A2A spec</a>
+      </footer>
+    </div>
+
+    <script>
+      const form = document.getElementById("form");
+      const promptEl = document.getElementById("prompt");
+      const submitBtn = document.getElementById("submit");
+      const clearBtn = document.getElementById("clear");
+      const chatEl = document.getElementById("chat");
+      const placeholder = document.getElementById("placeholder");
+
+      // ── Examples from Agent Card ────────────────────────────
+      (async () => {
+        try {
+          const resp = await fetch("/.well-known/agent-card.json");
+          const card = await resp.json();
+          const container = document.getElementById("examples");
+          const seen = new Set();
+          for (const skill of card.skills || []) {
+            for (const ex of skill.examples || []) {
+              const key = ex.slice(0, 30);
+              if (seen.has(key)) continue;
+              seen.add(key);
+              const label = ex.length > 40 ? ex.slice(0, 40) + "…" : ex;
+              const a = document.createElement("a");
+              a.className = "example";
+              a.textContent = `${skill.id}: ${label}`;
+              a.title = ex;
+              a.onclick = () => {
+                promptEl.value = ex;
+                promptEl.focus();
+              };
+              container.appendChild(a);
             }
-          })
-        });
-
-        const elapsed = Math.round((Date.now() - start) / 1000);
-        const data = await resp.json();
-
-        if (data.status && data.status.state === 'COMPLETED') {
-          const agentReply = data.history && data.history[data.history.length - 1];
-          const replyText = agentReply && agentReply.content && agentReply.content[0] && agentReply.content[0].text;
-          responseEl.className = 'response success';
-          responseEl.textContent = replyText || '(empty response)';
-          metaEl.textContent = `Task ${data.id || '?'} — ${elapsed}s — ${data.history ? data.history.length : 0} messages`;
-        } else if (data.status && data.status.state === 'FAILED') {
-          responseEl.className = 'response error';
-          responseEl.textContent = data.status.message || 'Task failed';
-          metaEl.textContent = `Task ${data.id || '?'} — ${elapsed}s`;
-        } else {
-          responseEl.className = 'response';
-          responseEl.textContent = JSON.stringify(data, null, 2);
-          metaEl.textContent = `${elapsed}s`;
+          }
+        } catch (err) {
+          console.warn("Could not load examples from Agent Card:", err);
         }
-      } catch (err) {
-        responseEl.className = 'response error';
-        responseEl.textContent = 'Помилка: ' + err.message;
-      } finally {
-        submitBtn.disabled = false;
+      })();
+
+      // ── Chat history rendering ──────────────────────────────
+      function clearPlaceholder() {
+        if (placeholder && placeholder.parentNode) {
+          placeholder.parentNode.removeChild(placeholder);
+        }
       }
-    });
-  </script>
-</body>
+
+      function addTurn(role, text, meta) {
+        clearPlaceholder();
+        const turn = document.createElement("div");
+        turn.className = "turn " + role;
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+        turn.appendChild(bubble);
+        if (meta) {
+          const m = document.createElement("div");
+          m.className = "meta";
+          m.textContent = meta;
+          turn.appendChild(m);
+        }
+        chatEl.appendChild(turn);
+        chatEl.scrollTop = chatEl.scrollHeight;
+        return { turn, bubble };
+      }
+
+      function setAgentResult(turn, bubble, kind, text, meta) {
+        turn.classList.remove("loading");
+        turn.classList.add(kind);
+        bubble.textContent = text;
+        const metaEl = turn.querySelector(".meta");
+        if (metaEl) metaEl.textContent = meta;
+      }
+
+      // ── Submit ──────────────────────────────────────────────
+      async function sendMessage() {
+        const text = promptEl.value.trim();
+        if (!text) return;
+
+        addTurn("user", text);
+        promptEl.value = "";
+        promptEl.focus();
+        submitBtn.disabled = true;
+
+        const { turn, bubble } = addTurn(
+          "agent",
+          "Orchestrator думає... (multi-agent decomposition може зайняти кілька хвилин)",
+          ""
+        );
+        turn.classList.add("loading");
+
+        const start = Date.now();
+        try {
+          const resp = await fetch("/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: {
+                role: "user",
+                content: [{ type: "text", text: text }],
+              },
+            }),
+          });
+          const elapsed = Math.round((Date.now() - start) / 1000);
+          const data = await resp.json();
+
+          const taskId = (data.id || "").slice(0, 8);
+          if (data.status && data.status.state === "COMPLETED") {
+            const last = data.history && data.history[data.history.length - 1];
+            const replyText =
+              (last && last.content && last.content[0] && last.content[0].text) ||
+              "(empty response)";
+            setAgentResult(
+              turn,
+              bubble,
+              "success",
+              replyText,
+              `task=${taskId} · ${elapsed}s · ${data.history ? data.history.length : 0} msgs`
+            );
+          } else if (data.status && data.status.state === "FAILED") {
+            setAgentResult(
+              turn,
+              bubble,
+              "error",
+              data.status.message || "Task failed",
+              `task=${taskId} · ${elapsed}s`
+            );
+          } else {
+            setAgentResult(
+              turn,
+              bubble,
+              "",
+              JSON.stringify(data, null, 2),
+              `${elapsed}s`
+            );
+          }
+        } catch (err) {
+          setAgentResult(turn, bubble, "error", "Помилка: " + err.message, "");
+        } finally {
+          submitBtn.disabled = false;
+        }
+      }
+
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        sendMessage();
+      });
+
+      // Cmd/Ctrl+Enter = submit
+      promptEl.addEventListener("keydown", (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+
+      clearBtn.addEventListener("click", () => {
+        if (!confirm("Очистити поточну розмову?")) return;
+        chatEl.innerHTML = "";
+        const p = document.createElement("div");
+        p.className = "placeholder";
+        p.id = "placeholder";
+        p.textContent = "Conversation очищена. Введи новий запит щоб почати.";
+        chatEl.appendChild(p);
+      });
+    </script>
+  </body>
 </html>
