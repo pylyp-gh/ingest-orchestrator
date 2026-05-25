@@ -15,6 +15,7 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/router"
 )
 
 // SendMessageRequest mirrors the A2A spec request shape.
@@ -50,13 +51,17 @@ type Status struct {
 	Message   string    `json:"message,omitempty"`
 }
 
-// Handler bundles dependencies needed by the A2A handlers — Claude wrapper
-// and MCP client session. Constructed once at startup and reused across
-// requests (session reuse → connection keep-alive on both sides).
+// Handler bundles dependencies needed by the A2A handlers: Claude wrapper,
+// MCP client session, peer discovery, and the optional Haiku-based tier
+// Classifier. Constructed once at startup and reused across requests
+// (session reuse → connection keep-alive on both sides). A nil
+// Classifier signals that router is disabled; Loop honours that and
+// skips the per-turn classification call.
 type Handler struct {
-	Claude    *llm.Claude
-	MCP       *mcpclient.Client
-	Discovery *peer.Discovery
+	Claude     *llm.Claude
+	MCP        *mcpclient.Client
+	Discovery  *peer.Discovery
+	Classifier *router.Classifier
 }
 
 // SendMessage is the A2A POST /messages handler. Drives the Claude agent
@@ -84,7 +89,7 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		History: []Message{req.Message},
 	}
 
-	answer, err := Loop(r.Context(), h.Claude, h.MCP, h.Discovery, userText)
+	answer, err := Loop(r.Context(), h.Claude, h.MCP, h.Discovery, h.Classifier, userText)
 	if err != nil {
 		task.Status = Status{
 			State:     "FAILED",

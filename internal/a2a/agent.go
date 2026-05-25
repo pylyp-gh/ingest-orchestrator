@@ -24,6 +24,7 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/router"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/tracing"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -59,7 +60,15 @@ Reply in the language of the user. If a peer returns an error, explain what happ
 // presented to Claude is the union of MCP tools (add_document via
 // doc-writer-mcp) plus the delegate_to_kagent_peer A2A meta-tool whose
 // enum is built from the live kagent peer list.
-func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discovery *peer.Discovery, userText string) (answer string, err error) {
+//
+// If classifier is non-nil, a single Haiku classification call runs
+// before the main loop. The resulting Verdict is attached to the
+// per-turn context so every llm.Complete inside the loop honours the
+// chosen tier (different baseURL + model). When classifier is nil
+// (ROUTER_ENABLED=false or env unconfigured), Loop behaves exactly as
+// before: Claude uses its configured primary tier with no per-turn
+// override.
+func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discovery *peer.Discovery, classifier *router.Classifier, userText string) (answer string, err error) {
 	ctx, rootSpan := tracing.Tracer().Start(ctx, "orchestrator.loop")
 	tracing.SetKind(rootSpan, tracing.KindAgent)
 	rootSpan.SetAttributes(
@@ -70,6 +79,21 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 		rootSpan.SetAttributes(attribute.String("output.value", truncate(answer, 480)))
 		tracing.EndWithErr(rootSpan, err)
 	}()
+
+	// Classify once per turn. Subsequent iterations of the tool-use loop
+	// reuse the same Verdict via context, so the user pays for one
+	// Haiku call per turn regardless of how many tool calls fire.
+	if classifier != nil {
+		verdict, cerr := classifier.Classify(ctx, userText)
+		if cerr != nil {
+			log.Printf("router: classify failed (%v), continuing with default tier", cerr)
+		}
+		ctx = router.WithVerdict(ctx, verdict)
+		rootSpan.SetAttributes(
+			attribute.String("router.tier", verdict.Tier.String()),
+			attribute.String("router.reason", verdict.Reason),
+		)
+	}
 
 	tools := mcpToolsToOpenAI(mc.Tools())
 	var peers []peer.Peer

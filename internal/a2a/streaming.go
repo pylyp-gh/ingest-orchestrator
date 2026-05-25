@@ -103,7 +103,7 @@ func (h *StreamingHandler) SendStreamingMessage(w http.ResponseWriter, r *http.R
 	}
 	defer perReq.Close()
 
-	answer, err := Loop(r.Context(), h.Claude, perReq, h.Discovery, userText)
+	answer, err := Loop(r.Context(), h.Claude, perReq, h.Discovery, h.Classifier, userText)
 	if err != nil {
 		emit(streamEvent{Status: "FAILED", Error: err.Error()})
 		return

@@ -27,6 +27,7 @@ import (
 	"github.com/pylyp-gh/ingest-orchestrator/internal/llm"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/mcpclient"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/peer"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/router"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/tracing"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -81,6 +82,24 @@ func run() error {
 	claude := llm.New()
 	log.Printf("claude wrapper configured: model=%s", claude.Model())
 
+	// Tier classifier: gated by ROUTER_ENABLED=true. When enabled and the
+	// ROUTER_CLASSIFIER_* env vars are set, every new user turn passes
+	// through a single Haiku classification call before the main tool-use
+	// loop; the chosen tier propagates into llm.Complete via context. When
+	// disabled or unconfigured, the orchestrator behaves exactly как
+	// раніше (claude uses its constructor-time primary).
+	var classifier *router.Classifier
+	if os.Getenv("ROUTER_ENABLED") == "true" {
+		cls, cerr := router.NewClassifier()
+		if cerr != nil {
+			log.Printf("WARN: router classifier init failed (%v), continuing без router", cerr)
+		}
+		classifier = cls
+		if classifier == nil {
+			log.Printf("router: ROUTER_ENABLED=true but ROUTER_CLASSIFIER_BASE_URL / _MODEL missing, router disabled")
+		}
+	}
+
 	pending := elicit.NewPendingRegistry()
 
 	// Shared MCP client used by the sync /messages handler. Its Elicitation
@@ -107,7 +126,7 @@ func run() error {
 		go discovery.Run(ctx, 5*time.Minute)
 	}
 
-	handler := &a2a.Handler{Claude: claude, MCP: mc, Discovery: discovery}
+	handler := &a2a.Handler{Claude: claude, MCP: mc, Discovery: discovery, Classifier: classifier}
 	streamHandler := &a2a.StreamingHandler{Handler: handler, Pending: pending}
 	respondHandler := &a2a.RespondHandler{Pending: pending}
 

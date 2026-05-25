@@ -71,6 +71,7 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/pylyp-gh/ingest-orchestrator/internal/router"
 	"github.com/pylyp-gh/ingest-orchestrator/internal/tracing"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -176,14 +177,43 @@ func (c *Claude) Complete(
 	// One root LLM span per logical Complete call. If we fall back to a
 	// secondary provider mid-flight, we record that as an event +
 	// attribute on the same span rather than spawning a sibling span,
-	// because semantically це **one** logical model invocation —
-	// fallback is a transport-level detail, not a separate operation.
+	// because semantically це **one** logical model invocation: fallback
+	// is a transport-level detail, not a separate operation.
 	ctx, span := tracing.Tracer().Start(ctx, "llm.chat.completions")
 	tracing.SetKind(span, tracing.KindLLM)
+
+	// If the router has classified this turn, swap to the tier client
+	// for the duration of this Complete. Per-call temporary client so
+	// the constructor stays simple and we don't carry tier-aware state
+	// on the Claude struct.
+	primaryClient := c.primary
+	primaryModel := c.primaryModel
+	primaryLabel := c.primaryLabel
+	if verdict, ok := router.VerdictFromContext(ctx); ok {
+		if base, model, rerr := router.Resolve(verdict.Tier); rerr == nil {
+			primaryClient = openai.NewClient(
+				option.WithBaseURL(base),
+				option.WithAPIKey(envOr("OPENAI_API_KEY", "stub-gateway-injects-real-key")),
+			)
+			primaryModel = model
+			primaryLabel = verdict.Tier.String()
+			span.SetAttributes(
+				attribute.String("router.tier", verdict.Tier.String()),
+				attribute.String("router.reason", verdict.Reason),
+				attribute.String("llm.requested.model", model),
+			)
+		} else {
+			// Verdict present but env unresolved: log and fall through
+			// to the constructor-time primary so the call still works.
+			log.Printf("llm: router verdict %s unresolved (%v), using default %s",
+				verdict.Tier, rerr, c.primaryModel)
+		}
+	}
+
 	span.SetAttributes(
 		attribute.String("llm.system", "openai"),
 		attribute.String("llm.provider", "anthropic"), // real upstream via gateway
-		attribute.String("llm.model_name", c.primaryModel),
+		attribute.String("llm.model_name", primaryModel),
 		attribute.Int("llm.tools.count", len(tools)),
 		attribute.Int("llm.messages.count", len(messages)),
 	)
@@ -197,7 +227,7 @@ func (c *Claude) Complete(
 	}
 
 	params := openai.ChatCompletionNewParams{
-		Model:    openai.ChatModel(c.primaryModel),
+		Model:    openai.ChatModel(primaryModel),
 		Messages: messages,
 	}
 	if len(tools) > 0 {
@@ -241,9 +271,9 @@ func (c *Claude) Complete(
 		}
 	}
 
-	resp, err := c.primary.Chat.Completions.New(ctx, params, callOpts...)
-	usedLabel := c.primaryLabel
-	usedModel := c.primaryModel
+	resp, err := primaryClient.Chat.Completions.New(ctx, params, callOpts...)
+	usedLabel := primaryLabel
+	usedModel := primaryModel
 
 	if err != nil && c.fallback != nil && isFallbackEligibleErr(err) {
 		// Record the primary failure as a span event так Phoenix shows
@@ -254,8 +284,8 @@ func (c *Claude) Complete(
 			attribute.String("llm.fallback.trigger", apiErr.Message),
 			attribute.Int("llm.primary.status_code", apiErr.StatusCode),
 		))
-		log.Printf("llm: primary %s failed (HTTP %d %s) — falling back to %s",
-			c.primaryLabel, apiErr.StatusCode, apiErr.Type, c.fallbackLabel)
+		log.Printf("llm: primary %s failed (HTTP %d %s), falling back to %s",
+			primaryLabel, apiErr.StatusCode, apiErr.Type, c.fallbackLabel)
 
 		params.Model = openai.ChatModel(c.fallbackModel)
 		resp, err = c.fallback.Chat.Completions.New(ctx, params)
