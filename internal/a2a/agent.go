@@ -14,6 +14,8 @@ package a2a
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -47,6 +49,10 @@ Your toolbelt:
 2. delegate_to_kagent_peer (A2A) — invoke any kagent peer agent by name. See the tool description for the list of available peers and what each does. Use this to:
    - Hand off a single subtask to a specialist (e.g. k8s-agent for cluster queries)
    - Decompose a complex multi-domain request into parallel delegations (multiple tool_calls in one turn) and aggregate the results yourself
+
+Anti-loop rule (critical):
+
+After receiving a tool reply from a peer or MCP tool, DO NOT call that same tool again with a similar prompt in this turn. Trust the first reply. If the reply is incomplete or wrong, surface that in your final answer ("doc-agent did not cover X, so I cannot fully cross-reference") instead of re-querying. Only retry if the previous call explicitly returned an error message. Re-querying the same peer wastes tokens and burns the iteration budget; the orchestrator will return cached results on duplicate calls anyway, so a second call gives you nothing new.
 
 Team-coordination guidance:
 - Read the user's request and identify how many distinct domains it touches (docs ingest, cluster inspection, helm releases, observability, mesh diagnostics).
@@ -115,6 +121,14 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 		openai.UserMessage(userText),
 	}
 
+	// Turn-scoped tool-call memoisation. Claude has been observed re-querying
+	// the same peer with cosmetic prompt variations during cross-reference
+	// tasks, burning iterations on redundant work. We hash (tool_name + args)
+	// and short-circuit duplicates with the cached reply plus an inline note
+	// so Claude sees that re-querying gave nothing new. Cache lives for the
+	// duration of this Loop call only; next turn starts fresh.
+	cache := map[string]string{}
+
 	for i := 0; i < maxIterations; i++ {
 		assistant, cerr := claude.Complete(ctx, messages, tools)
 		if cerr != nil {
@@ -134,7 +148,7 @@ func Loop(ctx context.Context, claude *llm.Claude, mc *mcpclient.Client, discove
 
 		// Execute each tool call serially, append result messages.
 		for _, call := range assistant.ToolCalls {
-			result := executeToolCall(ctx, mc, call)
+			result := executeToolCall(ctx, mc, call, cache)
 			messages = append(messages, openai.ToolMessage(result, call.ID))
 		}
 	}
@@ -151,12 +165,29 @@ func truncate(s string, n int) string {
 	return tracing.SafeTrunc(s, n)
 }
 
+// toolCacheKey derives a stable identifier for a tool call so duplicate
+// invocations within the same turn can be short-circuited. We hash the
+// (tool name + canonical args JSON) so Claude's cosmetic prompt rewrites
+// ("List the pods" vs "List pods") still hit the cache if they hash the
+// same; if Claude рerly tweaks the args (different namespace, different
+// peer, different parameters), the hash differs and the real call fires.
+func toolCacheKey(toolName, argsJSON string) string {
+	h := sha256.Sum256([]byte(toolName + "\x00" + argsJSON))
+	return hex.EncodeToString(h[:12])
+}
+
 // executeToolCall invokes the named MCP tool with the JSON arguments from
 // Claude. Returns a textual result string suitable for feeding back as a
 // "tool" role message. Errors are surfaced as text so Claude can see them
 // and adjust strategy (e.g., "duplicate exists — ask user").
-func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.ChatCompletionMessageToolCall) string {
+//
+// cache is a turn-scoped map of toolCacheKey -> previous result text.
+// On cache hit we return the prior reply prepended with a banner so
+// Claude sees the duplicate-call signal and (per system-prompt guidance)
+// pivots to synthesis instead of re-issuing the same call again.
+func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.ChatCompletionMessageToolCall, cache map[string]string) string {
 	name := call.Function.Name
+	cacheKey := toolCacheKey(name, call.Function.Arguments)
 
 	// Wrap entire tool dispatch у one span. Kind = AGENT для peer
 	// delegation (downstream A2A invocation has its own loop), TOOL
@@ -164,9 +195,23 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 	ctx, span := tracing.Tracer().Start(ctx, "tool.call."+name)
 	span.SetAttributes(
 		attribute.String("tool.name", name),
+		attribute.String("tool.cache_key", cacheKey),
 		attribute.String("input.value", truncate(call.Function.Arguments, 480)),
 	)
 	defer span.End()
+
+	// Memoisation: identical (tool, args) inside one Loop = duplicate.
+	// Return prior reply with explicit duplicate-call notice so Claude's
+	// next planning turn sees nothing new came back and pivots to
+	// synthesising the answer from evidence already in the conversation.
+	if prior, hit := cache[cacheKey]; hit {
+		log.Printf("[agent] tool call: %s args=%s -> cached", name, call.Function.Arguments)
+		span.SetAttributes(attribute.Bool("tool.cached", true))
+		banner := "⚠️ duplicate call: same tool + arguments were already executed earlier in this turn. The previous reply is below; do NOT re-issue this call. Synthesise your final answer from the evidence already in your context.\n\n--- previous reply ---\n"
+		out := banner + prior
+		span.SetAttributes(attribute.String("output.value", truncate(out, 480)))
+		return out
+	}
 
 	var args map[string]any
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -174,6 +219,8 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 		msg := fmt.Sprintf("error: failed to parse tool arguments JSON: %v (raw: %q)", err, call.Function.Arguments)
 		span.SetAttributes(attribute.String("output.value", msg))
 		tracing.EndWithErr(span, err)
+		// Errors NOT cached: a transient parse error shouldn't poison
+		// the cache for a possible retry with corrected args.
 		return msg
 	}
 	log.Printf("[agent] tool call: %s args=%s", name, call.Function.Arguments)
@@ -197,6 +244,7 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 			return msg
 		}
 		span.SetAttributes(attribute.String("output.value", truncate(out, 480)))
+		cache[cacheKey] = out
 		return out
 	}
 
@@ -225,6 +273,11 @@ func executeToolCall(ctx context.Context, mc *mcpclient.Client, call openai.Chat
 		attribute.Bool("tool.is_error", resp.IsError),
 		attribute.String("output.value", truncate(out, 480)),
 	)
+	// Cache successful results only; tool errors (resp.IsError) are not
+	// cached so Claude can retry with corrected inputs on the next pass.
+	if !resp.IsError {
+		cache[cacheKey] = out
+	}
 	return out
 }
 
