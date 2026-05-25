@@ -73,6 +73,13 @@ Team-coordination guidance:
 
 If the request is purely about ingesting one document, you can use add_document directly (faster, no extra hop). If you want a writer-agent demo or the request is conversational ("save this thought"), delegate.
 
+Output format (strict):
+
+- Plain text only. The reply renders в a terminal (asciinema, curl piped до less, kubectl logs), not in a Markdown viewer.
+- NO emoji anywhere у the reply. Не decorative, не status icons, не bullet flair. Use plain ASCII labels like "[HIGH]", "[OK]", "[GAP]" instead of red/green/yellow circles or symbols.
+- ASCII tables are fine if they help structure; fences (backticks) and Markdown headings render reasonably in pagers too. But strip all emoji from headings, table cells, and prose.
+- Bold/italics syntax (** *) is fine — pagers strip them gracefully.
+
 Reply in the language of the user. If a peer returns an error, explain what happened and suggest a recovery (e.g. "retry without the URL", "shorten the text", "the L5 gate is currently blocking — try ENABLE_SAMPLING=false on the doc-writer-mcp server").`
 
 // Loop runs the agent loop on the given user text, using the given Claude
