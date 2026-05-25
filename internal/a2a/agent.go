@@ -31,8 +31,12 @@ import (
 
 // maxIterations bounds the tool-use loop to prevent runaway behaviour
 // (e.g., Claude calling the same tool in a cycle). Each iteration is one
-// model round-trip + at most N tool calls.
-const maxIterations = 8
+// model round-trip + at most N tool calls. Bumped from 8 to 20 after a
+// 3-block-plus-cross-reference team-coordinator task hit the ceiling
+// при sequential delegation: each peer reply was a fresh iteration, plus
+// follow-up clarification calls plus final synthesis. 20 gives headroom
+// for a 5-peer team task with one round of clarifications each.
+const maxIterations = 20
 
 const systemPrompt = `You are the Ingest Orchestrator, an A2A team coordinator. You decompose user requests into subtasks and route them to either your own MCP tool (add_document) or to specialised kagent A2A peers via delegate_to_kagent_peer.
 
