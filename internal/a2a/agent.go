@@ -50,9 +50,19 @@ Your toolbelt:
    - Hand off a single subtask to a specialist (e.g. k8s-agent for cluster queries)
    - Decompose a complex multi-domain request into parallel delegations (multiple tool_calls in one turn) and aggregate the results yourself
 
-Anti-loop rule (critical):
+Anti-loop rule (critical, ENFORCED):
 
-After receiving a tool reply from a peer or MCP tool, DO NOT call that same tool again with a similar prompt in this turn. Trust the first reply. If the reply is incomplete or wrong, surface that in your final answer ("doc-agent did not cover X, so I cannot fully cross-reference") instead of re-querying. Only retry if the previous call explicitly returned an error message. Re-querying the same peer wastes tokens and burns the iteration budget; the orchestrator will return cached results on duplicate calls anyway, so a second call gives you nothing new.
+You may call each kagent peer (k8s-agent, helm-agent, doc-agent, etc.) AT MOST ONCE per turn. The orchestrator strictly enforces this: any second call to the same peer, no matter how you rephrase the prompt, returns the FIRST reply with a duplicate-call banner. There is no way to get new evidence from a peer mid-turn.
+
+What this means for you:
+
+- Bundle multiple questions into one delegation. If you need namespaces AND agent CRDs AND HTTPRoutes from k8s-agent, ask for all three in ONE delegate_to_kagent_peer call. Don't split into three calls hoping for cleaner replies, the second and third will be cached.
+
+- Trust the first reply. If it is incomplete, surface that in your final answer ("doc-agent's reply did not cover X, so I cannot fully cross-reference") instead of trying a paraphrased re-query.
+
+- Only retry on explicit error messages (the previous reply starts with "error:" or "error from peer:"). Cosmetic dissatisfaction is not grounds for retry.
+
+For MCP tools (add_document, echo, etc.) the cache is keyed on the full arguments, so different parameters (different document content, different file path) trigger fresh calls as expected.
 
 Team-coordination guidance:
 - Read the user's request and identify how many distinct domains it touches (docs ingest, cluster inspection, helm releases, observability, mesh diagnostics).
@@ -166,14 +176,33 @@ func truncate(s string, n int) string {
 }
 
 // toolCacheKey derives a stable identifier for a tool call so duplicate
-// invocations within the same turn can be short-circuited. We hash the
-// (tool name + canonical args JSON) so Claude's cosmetic prompt rewrites
-// ("List the pods" vs "List pods") still hit the cache if they hash the
-// same; if Claude рerly tweaks the args (different namespace, different
-// peer, different parameters), the hash differs and the real call fires.
+// invocations within the same turn can be short-circuited.
+//
+// For delegate_to_kagent_peer we key ONLY on agent_name and IGNORE the
+// text argument. Observed behaviour: Claude paraphrases the same logical
+// query into cosmetically different prompts ("comprehensive overview" /
+// "detailed cluster state report" / etc.) hash that on raw args and the
+// cache misses every time. Keying on agent alone enforces a strict
+// one-call-per-peer-per-turn policy. Legitimate different sub-queries
+// to the same peer (e.g. "list pods" then "describe pod foo") are
+// collapsed too, but that is acceptable: the agent can answer multi-
+// part questions in a single delegation, and the system prompt now
+// instructs Claude to bundle questions accordingly.
+//
+// For other tools (MCP add_document, echo, anything that is not a peer
+// delegation) we hash (tool_name + canonical args JSON): different
+// args usually mean different real work.
 func toolCacheKey(toolName, argsJSON string) string {
+	if toolName == PeerToolName {
+		// Extract agent_name and key only on that
+		var args struct {
+			AgentName string `json:"agent_name"`
+		}
+		_ = json.Unmarshal([]byte(argsJSON), &args)
+		return "peer:" + args.AgentName
+	}
 	h := sha256.Sum256([]byte(toolName + "\x00" + argsJSON))
-	return hex.EncodeToString(h[:12])
+	return "tool:" + hex.EncodeToString(h[:12])
 }
 
 // executeToolCall invokes the named MCP tool with the JSON arguments from
